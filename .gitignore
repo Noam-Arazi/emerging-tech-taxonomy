@@ -1,0 +1,7 @@
+credentials.json
+המרה לאמזון/קרדנשיאלס/
+__pycache__/
+.DS_Store
+*.docx
+*.xlsx
+*.csv
