@@ -1,17 +1,16 @@
 import os
 import time
+import json
 import pandas as pd
 import numpy as np
 from scipy.cluster.hierarchy import linkage, fcluster
 from sklearn.metrics import silhouette_score
-import vertexai
-from vertexai.language_models import TextEmbeddingModel
-from vertexai.generative_models import GenerativeModel
+import boto3
 
 # --- CONFIGURATION ---
-CREDENTIALS_PATH = 'credentials.json'
-PROJECT_ID = 'noamarazi'
-LOCATION = 'us-central1'
+# Import AWS credentials from config.py (not tracked in git)
+from config import AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION
+
 INPUT_FILE = 'list-main-tech.csv'
 OUTPUT_FILE = 'hierarchical_taxonomy_results.xlsx'
 
@@ -22,31 +21,56 @@ MAX_DEPTH = 4               # עומק מקסימלי
 COHERENCE_THRESHOLD = 0.05  # סף לזיהוי קבוצה הטרוגנית
 
 # --- AUTHENTICATION & INIT ---
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = CREDENTIALS_PATH
-
 try:
-    vertexai.init(project=PROJECT_ID, location=LOCATION)
-    embedding_model = TextEmbeddingModel.from_pretrained("text-embedding-004")
-    gen_model = GenerativeModel("gemini-2.5-pro") 
-    print("✅ Connected to Vertex AI")
+    bedrock_runtime = boto3.client(
+        service_name='bedrock-runtime',
+        region_name=AWS_REGION,
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY
+    )
+    print("✅ Connected to Amazon Bedrock")
 except Exception as e:
     print(f"❌ Connection Failed: {e}")
     exit()
 
+# Model IDs
+EMBEDDING_MODEL_ID = "amazon.titan-embed-text-v2:0"  # 1024 dimensions
+TEXT_MODEL_ID = "anthropic.claude-3-sonnet-20240229-v1:0"
+
+
 def get_batch_embeddings(texts, batch_size=5):
-    """מייצר אמבדינגס בקבוצות כדי לא לחרוג ממגבלות"""
+    """מייצר אמבדינגס באמצעות Amazon Titan"""
     embeddings = []
     print(f"   ⏳ Embedding {len(texts)} items...")
+
     for i in range(0, len(texts), batch_size):
         batch = texts[i:i+batch_size]
-        try:
-            result = embedding_model.get_embeddings(batch)
-            embeddings.extend([e.values for e in result])
-            time.sleep(0.2) 
-        except Exception as e:
-            print(f"Error in batch {i}: {e}")
-            embeddings.extend([[0.0]*768 for _ in range(len(batch))]) 
+        for text in batch:
+            try:
+                body = json.dumps({
+                    "inputText": text[:8000],  # Titan limit
+                    "dimensions": 1024,
+                    "normalize": True
+                })
+                response = bedrock_runtime.invoke_model(
+                    modelId=EMBEDDING_MODEL_ID,
+                    body=body,
+                    contentType="application/json",
+                    accept="application/json"
+                )
+                result = json.loads(response['body'].read())
+                embeddings.append(result['embedding'])
+            except Exception as e:
+                print(f"Error embedding text: {e}")
+                embeddings.append([0.0] * 1024)  # fallback
+
+        time.sleep(0.1)  # Rate limiting
+
+        if (i + batch_size) % 50 == 0:
+            print(f"   ... processed {min(i + batch_size, len(texts))}/{len(texts)}")
+
     return np.array(embeddings)
+
 
 def create_clean_context(row):
     """context נקי ופשוט"""
@@ -54,9 +78,10 @@ def create_clean_context(row):
     desc = str(row['Technology_Description'])
     return f"Technology: {name}. Description: {desc}"
 
+
 def name_cluster_with_ai(titles_list, parent_name=None):
     """
-    נותן שם לקבוצה - עם הקשר להורה אם קיים
+    נותן שם לקבוצה באמצעות Claude - עם הקשר להורה אם קיים
     """
     sample_titles = titles_list[:30]
     list_text = "\n".join([f"- {t}" for t in sample_titles])
@@ -64,32 +89,45 @@ def name_cluster_with_ai(titles_list, parent_name=None):
     forbidden = "Do NOT use generic words like: Frontier, Emerging, Exotic, Advanced, Novel, Breakthrough, Cutting-edge, Next-gen, Innovative, Future."
 
     if parent_name:
-        prompt = f"""
-Here is a sub-group of technologies under "{parent_name}":
+        prompt = f"""Here is a sub-group of technologies under "{parent_name}":
 {list_text}
 
 Task: Provide a short, SPECIFIC Category Name (2-5 words).
 {forbidden}
 The name must describe the TECHNICAL DOMAIN, not how "new" or "advanced" it is.
-Output ONLY the category name.
-"""
+Output ONLY the category name."""
     else:
-        prompt = f"""
-Here is a list of technologies grouped together:
+        prompt = f"""Here is a list of technologies grouped together:
 {list_text}
 
 Task: Provide a short, SPECIFIC Category Name (2-4 words).
 {forbidden}
 Focus on the TECHNICAL DOMAIN (e.g., "DNA Energy Storage", "Quantum Sensors", "Weather Modification").
-Output ONLY the category name.
-"""
+Output ONLY the category name."""
 
     try:
-        response = gen_model.generate_content(prompt)
-        return response.text.strip().replace('"', '').replace("Category Name:", "").replace("Category:", "")
+        body = json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 100,
+            "messages": [
+                {"role": "user", "content": prompt}
+            ]
+        })
+
+        response = bedrock_runtime.invoke_model(
+            modelId=TEXT_MODEL_ID,
+            body=body,
+            contentType="application/json",
+            accept="application/json"
+        )
+
+        result = json.loads(response['body'].read())
+        text = result['content'][0]['text'].strip()
+        return text.replace('"', '').replace("Category Name:", "").replace("Category:", "").strip()
     except Exception as e:
         print(f"Naming error: {e}")
         return "Unclassified"
+
 
 def check_cluster_coherence(embeddings):
     """
@@ -164,6 +202,7 @@ def should_split_cluster(size, depth, coherence_score=None):
         return True, "normal"
 
     return False, "normal"
+
 
 def hierarchical_cluster(df, embeddings, depth=0, parent_path="", parent_name=None):
     """
@@ -250,6 +289,7 @@ def hierarchical_cluster(df, embeddings, depth=0, parent_path="", parent_name=No
         all_results.extend(sub_results)
 
     return all_results
+
 
 def assign_hierarchical_ids(result_df):
     """
@@ -449,40 +489,41 @@ def create_summary_sheet(result_df):
 
     return summary_df
 
+
 def main():
     # 1. טעינת נתונים
     if not os.path.exists(INPUT_FILE):
         print(f"❌ File {INPUT_FILE} not found.")
         return
-        
+
     df = pd.read_csv(INPUT_FILE)
     print(f"📂 Loaded {len(df)} technologies.\n")
-    
+
     # 2. הכנת הטקסט
     df['embedding_text'] = df.apply(create_clean_context, axis=1)
-    
+
     # 3. יצירת וקטורים (פעם אחת)
     embeddings_matrix = get_batch_embeddings(df['embedding_text'].tolist())
-    
+
     print("\n" + "="*80)
     print("🌳 Starting Hierarchical Clustering")
     print("="*80 + "\n")
-    
+
     # 4. קלאסטרינג היררכי
     cluster_results = hierarchical_cluster(df, embeddings_matrix)
-    
+
     print("\n" + "="*80)
     print("📊 Clustering Complete!")
     print("="*80)
     print(f"Total leaf clusters: {len(cluster_results)}")
-    
+
     # הצגת סטטיסטיקה
     depths = [c['depth'] for c in cluster_results]
     sizes = [c['size'] for c in cluster_results]
     print(f"Depth range: {min(depths)} to {max(depths)}")
     print(f"Cluster size range: {min(sizes)} to {max(sizes)}")
     print(f"Average cluster size: {np.mean(sizes):.1f}")
-    
+
     # 5. בניית DataFrame סופי
     result_df = build_taxonomy_dataframe(df, cluster_results)
 
@@ -496,21 +537,22 @@ def main():
     with pd.ExcelWriter(OUTPUT_FILE, engine='openpyxl') as writer:
         result_df.to_excel(writer, sheet_name='Technologies', index=False)
         summary_df.to_excel(writer, sheet_name='Cluster Summary', index=False)
-    
+
     # הצגת סיכום לפי רמות
     print("\n" + "="*80)
     print("📋 Summary by Level")
     print("="*80)
-    
+
     level1_counts = result_df['category_level_1'].value_counts()
     print(f"\nLevel 1: {len(level1_counts)} categories")
     for cat, count in level1_counts.head(10).items():
         print(f"  {cat}: {count} technologies")
-    
+
     print(f"\n✅ Done! Results saved to {OUTPUT_FILE}")
     print(f"   Use category_level_1 for high-level view")
     print(f"   Use full_path for complete hierarchy")
     print(f"   Use leaf_category for most specific classification")
+
 
 if __name__ == "__main__":
     main()

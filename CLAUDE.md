@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This project performs hierarchical taxonomy classification of technologies using Google Vertex AI. It takes a CSV of technology names and descriptions, generates embeddings, and recursively clusters them into a multi-level taxonomy using Ward hierarchical clustering with coherence-aware splitting.
+This project performs hierarchical taxonomy classification of technologies using **Amazon Bedrock**. It takes a CSV of technology names and descriptions, generates embeddings, and recursively clusters them into a multi-level taxonomy using Ward hierarchical clustering with coherence-aware splitting.
 
 ## Running the Project
 
@@ -13,25 +13,26 @@ python hierarchical_taxonomy.py
 ```
 
 **Prerequisites:**
-- Valid `credentials.json` file for Google Cloud authentication
-- Input file: `list-main-tech.csv` with columns `technology_name` and `Technology_Description`
-- Output: `hierarchical_taxonomy_results.xlsx`
+1. Copy `config.example.py` to `config.py`
+2. Fill in your AWS credentials in `config.py`
+3. Input file: `list-main-tech.csv` with columns `technology_name` and `Technology_Description`
+4. Output: `hierarchical_taxonomy_results.xlsx`
 
 **Required Python packages:**
 - pandas, numpy, scipy, scikit-learn, openpyxl
-- google-cloud-aiplatform (vertexai)
+- boto3
 
 ## Architecture
 
 The system implements a coherence-aware recursive clustering approach:
 
-1. **Embedding Generation** (`get_batch_embeddings`): Batches texts through Vertex AI's `text-embedding-004` model (768-dim vectors)
+1. **Embedding Generation** (`get_batch_embeddings`): Sends texts to Amazon Titan Embed Text v2 model (1024-dim vectors)
 
 2. **Hierarchical Clustering** (`hierarchical_cluster`): Recursive function that:
    - Checks cluster coherence via silhouette score on a 2-cluster split
    - Decides whether to split based on size, depth, and coherence (scatter mode for low-coherence groups)
    - Uses Ward linkage with distance-based threshold to find optimal cluster count
-   - Calls Gemini to name each cluster based on member technologies
+   - Calls Claude 3 Sonnet (via Bedrock) to name each cluster based on member technologies
 
 3. **Split Decision Logic** (`should_split_cluster`): Controls recursion with `MIN_LEAF_SIZE=3`, `MAX_LEAF_SIZE=12`, `MAX_DEPTH=4`, and `COHERENCE_THRESHOLD=0.05`
 
@@ -68,7 +69,12 @@ The output Excel file (`hierarchical_taxonomy_results.xlsx`) contains two sheets
 ## Key Configuration Parameters
 
 Located at the top of `hierarchical_taxonomy.py`:
-- `PROJECT_ID`, `LOCATION`: Vertex AI project settings
+- `EMBEDDING_MODEL_ID`: Amazon Titan Embed Text v2 (1024 dimensions)
+- `TEXT_MODEL_ID`: Claude 3 Sonnet for cluster naming
 - `MIN_LEAF_SIZE`, `MAX_LEAF_SIZE`: Cluster size bounds
 - `MAX_DEPTH`: Maximum hierarchy depth
 - `COHERENCE_THRESHOLD`: Silhouette score threshold for scatter mode activation
+
+## Credentials
+
+AWS credentials are stored in `config.py` (not tracked in git). Use `config.example.py` as template.
