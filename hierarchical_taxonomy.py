@@ -1,557 +1,1383 @@
+"""
+Hierarchical Taxonomy Tool — Production Version
+=================================================
+Year-agnostic tool for classifying emerging technologies into a hierarchical
+taxonomy. Designed to run on any year's technology list without manual tuning.
+
+Based on experiment results:
+  - Embedding: Cohere Embed v3 (cohere.embed-english-v3)
+  - Text: technology_name + Technology_Description + WoS + OECD
+  - Clustering: Auto-selects best algorithm and k at each level
+  - Hierarchy: Stage 1 (L1 groups) → Stage 2 (L2 sub-groups) → optional L3
+
+Algorithms tested at each level (per advisor guidance):
+  KMeans, GMM, HDBSCAN, BIRCH, Agglomerative
+
+Usage:
+    python hierarchical_taxonomy.py
+"""
+
 import os
 import time
 import json
-import pandas as pd
+import warnings
+from collections import Counter
+from itertools import combinations
+
 import numpy as np
-from scipy.cluster.hierarchy import linkage, fcluster
+import pandas as pd
+from sklearn.cluster import (
+    AgglomerativeClustering,
+    KMeans,
+    HDBSCAN,
+    Birch,
+)
+from sklearn.mixture import GaussianMixture
 from sklearn.metrics import silhouette_score
 import boto3
 
-# --- CONFIGURATION ---
-# Import AWS credentials from config.py (not tracked in git)
 from config import AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION
 
-INPUT_FILE = 'list-main-tech.csv'
-OUTPUT_FILE = 'hierarchical_taxonomy_results.xlsx'
+warnings.filterwarnings("ignore")
 
-# פרמטרים - Coherence-Aware Splitting
-MIN_LEAF_SIZE = 3           # גודל מינימלי לעלה
-MAX_LEAF_SIZE = 12          # הורדה מ-20 ל-12!
-MAX_DEPTH = 4               # עומק מקסימלי
-COHERENCE_THRESHOLD = 0.05  # סף לזיהוי קבוצה הטרוגנית
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
 
-# --- AUTHENTICATION & INIT ---
-try:
-    bedrock_runtime = boto3.client(
-        service_name='bedrock-runtime',
-        region_name=AWS_REGION,
-        aws_access_key_id=AWS_ACCESS_KEY_ID,
-        aws_secret_access_key=AWS_SECRET_ACCESS_KEY
-    )
-    print("✅ Connected to Amazon Bedrock")
-except Exception as e:
-    print(f"❌ Connection Failed: {e}")
-    exit()
+INPUT_FILE = "list-main-tech.csv"
+OUTPUT_FILE = "hierarchical_taxonomy_results.xlsx"
 
-# Model IDs
-EMBEDDING_MODEL_ID = "amazon.titan-embed-text-v2:0"  # 1024 dimensions
+# Bedrock models
+EMBEDDING_MODEL_ID = "cohere.embed-english-v3"
 TEXT_MODEL_ID = "anthropic.claude-3-sonnet-20240229-v1:0"
 
+# Clustering search ranges
+L1_K_RANGE = range(4, 13)        # Stage 1: try 4-12 L1 groups
+L2_K_RANGE = range(2, 7)         # Stage 2: try 2-6 sub-groups within each L1
+L3_K_RANGE = range(2, 5)         # Stage 3: try 2-4 sub-sub-groups if needed
 
-def get_batch_embeddings(texts, batch_size=5):
-    """מייצר אמבדינגס באמצעות Amazon Titan"""
+# Thresholds
+MIN_CLUSTER_FOR_SPLIT = 8        # Don't sub-cluster groups smaller than this
+L2_QUALITY_THRESHOLD = 0.10      # Min avg silhouette to accept L2 split
+L3_QUALITY_THRESHOLD = 0.05      # Min avg silhouette to accept L3 split
+MAX_L1_RETRIES = 3               # Correction loop: retry L1 if L2 quality is bad
+LLM_TOP_N = 10                   # How many L1 candidates to LLM-check
+
+# Stage 1 scoring weights (tag metrics only — cheap pre-filter)
+METRIC_WEIGHTS = {
+    "wos_jaccard": 0.30,
+    "concept_coherence": 0.25,
+    "domain_overlap": 0.20,
+    "oecd_coherence": 0.15,
+    "silhouette": 0.10,
+}
+
+# Final scoring weights (from experiment — includes LLM coherence)
+FINAL_WEIGHTS = {
+    "llm_coherence": 0.40,
+    "wos_jaccard": 0.20,
+    "concept_coherence": 0.15,
+    "domain_overlap": 0.10,
+    "oecd_coherence": 0.10,
+    "silhouette": 0.05,
+}
+
+
+# ============================================================================
+# BEDROCK CLIENT
+# ============================================================================
+
+def create_bedrock_client():
+    client = boto3.client(
+        service_name="bedrock-runtime",
+        region_name=AWS_REGION,
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+    )
+    print("Connected to Amazon Bedrock")
+    return client
+
+
+# ============================================================================
+# EMBEDDING
+# ============================================================================
+
+def compose_text(row):
+    """Build embedding text from row fields (v4 template — best from experiment)."""
+    name = str(row["technology_name"])
+    desc = str(row["Technology_Description"])
+    wos = str(row.get("Web_of_Science_Category", ""))
+    oecd = str(row.get("OECD_Research_Area", ""))
+
+    parts = [f"Technology: {name}"]
+    if wos and wos != "nan":
+        parts.append(f"Scientific domains: {wos}")
+    if oecd and oecd != "nan":
+        parts.append(f"Research areas: {oecd}")
+    parts.append(f"Description: {desc}")
+    return ". ".join(parts)
+
+
+def get_embeddings(texts, client):
+    """Generate embeddings using Cohere Embed v3 on Bedrock."""
     embeddings = []
-    print(f"   ⏳ Embedding {len(texts)} items...")
+    batch_size = 10
 
     for i in range(0, len(texts), batch_size):
-        batch = texts[i:i+batch_size]
-        for text in batch:
-            try:
-                body = json.dumps({
-                    "inputText": text[:8000],  # Titan limit
-                    "dimensions": 1024,
-                    "normalize": True
-                })
-                response = bedrock_runtime.invoke_model(
-                    modelId=EMBEDDING_MODEL_ID,
-                    body=body,
-                    contentType="application/json",
-                    accept="application/json"
-                )
-                result = json.loads(response['body'].read())
-                embeddings.append(result['embedding'])
-            except Exception as e:
-                print(f"Error embedding text: {e}")
-                embeddings.append([0.0] * 1024)  # fallback
-
-        time.sleep(0.1)  # Rate limiting
+        batch = texts[i:i + batch_size]
+        body = json.dumps({
+            "texts": [t[:2048] for t in batch],
+            "input_type": "clustering",
+            "truncate": "END",
+        })
+        response = client.invoke_model(
+            modelId=EMBEDDING_MODEL_ID,
+            body=body,
+            contentType="application/json",
+            accept="application/json",
+        )
+        result = json.loads(response["body"].read())
+        embeddings.extend(result["embeddings"])
+        time.sleep(0.1)
 
         if (i + batch_size) % 50 == 0:
-            print(f"   ... processed {min(i + batch_size, len(texts))}/{len(texts)}")
+            print(f"   ... {min(i + batch_size, len(texts))}/{len(texts)}")
 
     return np.array(embeddings)
 
 
-def create_clean_context(row):
-    """context נקי ופשוט"""
-    name = str(row['technology_name'])
-    desc = str(row['Technology_Description'])
-    return f"Technology: {name}. Description: {desc}"
+# ============================================================================
+# TAG PARSING & METRICS
+# ============================================================================
+
+def parse_semicolon(s):
+    """'Cat1; Cat2' -> {'Cat1', 'Cat2'}"""
+    if pd.isna(s) or str(s).strip() in ("", "nan"):
+        return set()
+    return {x.strip() for x in str(s).split(";") if x.strip()}
 
 
-def name_cluster_with_ai(titles_list, parent_name=None):
+def parse_list(s):
+    """\"['tag1', 'tag2']\" -> {'tag1', 'tag2'}"""
+    if pd.isna(s) or str(s).strip() in ("", "nan", "[]"):
+        return set()
+    return {x.strip().strip("'\"") for x in str(s).strip("[]").split(",") if x.strip().strip("'\"") }
+
+
+def pairwise_jaccard(sets_list):
+    non_empty = [s for s in sets_list if s]
+    if len(non_empty) < 2:
+        return 0.0
+    total = 0.0
+    count = 0
+    for i in range(len(non_empty)):
+        for j in range(i + 1, len(non_empty)):
+            union = non_empty[i] | non_empty[j]
+            if union:
+                total += len(non_empty[i] & non_empty[j]) / len(union)
+            count += 1
+    return total / count if count else 0.0
+
+
+def concept_coherence(sets_list):
+    all_tags = []
+    for s in sets_list:
+        all_tags.extend(s)
+    if not all_tags:
+        return 0.0
+    top_tag, _ = Counter(all_tags).most_common(1)[0]
+    return sum(1 for s in sets_list if top_tag in s) / len(sets_list)
+
+
+def compute_tag_metrics(df, labels):
+    """Compute weighted-average tag metrics across clusters."""
+    wos = df["Web_of_Science_Category"].reset_index(drop=True).apply(parse_semicolon)
+    oecd = df["OECD_Research_Area"].reset_index(drop=True).apply(parse_semicolon)
+    concepts = df["emerging_tech_concepts"].reset_index(drop=True).apply(parse_list)
+    domains = df["applied_domain"].reset_index(drop=True).apply(parse_list)
+    labels = np.asarray(labels)
+
+    cluster_ids = sorted(set(labels))
+    weights = []
+    wos_s, concept_s, domain_s, oecd_s = [], [], [], []
+
+    for cid in cluster_ids:
+        mask = labels == cid
+        w = mask.sum()
+        weights.append(w)
+        wos_s.append(pairwise_jaccard(wos[mask].tolist()))
+        oecd_s.append(pairwise_jaccard(oecd[mask].tolist()))
+        domain_s.append(pairwise_jaccard(domains[mask].tolist()))
+        concept_s.append(concept_coherence(concepts[mask].tolist()))
+
+    w = np.array(weights, dtype=float)
+    w /= w.sum()
+
+    return {
+        "wos_jaccard": float(np.dot(wos_s, w)),
+        "concept_coherence": float(np.dot(concept_s, w)),
+        "domain_overlap": float(np.dot(domain_s, w)),
+        "oecd_coherence": float(np.dot(oecd_s, w)),
+    }
+
+
+def composite_score(tag_metrics, sil):
+    """Weighted composite score combining tag metrics and silhouette (Stage 1 pre-filter)."""
+    sil_norm = (sil + 1) / 2  # [-1,1] -> [0,1]
+    return (
+        METRIC_WEIGHTS["wos_jaccard"] * tag_metrics["wos_jaccard"]
+        + METRIC_WEIGHTS["concept_coherence"] * tag_metrics["concept_coherence"]
+        + METRIC_WEIGHTS["domain_overlap"] * tag_metrics["domain_overlap"]
+        + METRIC_WEIGHTS["oecd_coherence"] * tag_metrics["oecd_coherence"]
+        + METRIC_WEIGHTS["silhouette"] * sil_norm
+    )
+
+
+def check_cluster_coherence_llm(tech_names, tech_descriptions, client):
     """
-    נותן שם לקבוצה באמצעות Claude - עם הקשר להורה אם קיים
+    Send a cluster to Claude and get a 1-5 coherence rating.
+    Copied from the experiment framework (testing/clustering_experiment.py).
     """
-    sample_titles = titles_list[:30]
-    list_text = "\n".join([f"- {t}" for t in sample_titles])
+    items = []
+    for name, desc in zip(tech_names, tech_descriptions):
+        short_desc = str(desc)[:150]
+        items.append(f"- {name}: {short_desc}")
+    items_text = "\n".join(items[:30])  # cap at 30
 
-    forbidden = "Do NOT use generic words like: Frontier, Emerging, Exotic, Advanced, Novel, Breakthrough, Cutting-edge, Next-gen, Innovative, Future."
+    prompt = f"""Here are {len(tech_names)} technologies grouped together in a cluster:
+
+{items_text}
+
+Rate from 1 to 5 how coherent this group is as a scientific/technical domain:
+1 = Completely unrelated technologies, random mix
+2 = Weak connection, mostly different fields
+3 = Some shared themes but mixed domains
+4 = Clearly related, same broad technical field
+5 = Highly coherent, same specific scientific domain
+
+Are these technologies genuinely from the same field?
+
+Reply with ONLY a JSON object: {{"score": <1-5>, "reason": "<one sentence>"}}"""
+
+    try:
+        body = json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 150,
+            "messages": [{"role": "user", "content": prompt}],
+        })
+        response = client.invoke_model(
+            modelId=TEXT_MODEL_ID,
+            body=body,
+            contentType="application/json",
+            accept="application/json",
+        )
+        result = json.loads(response["body"].read())
+        text = result["content"][0]["text"].strip()
+        parsed = json.loads(text)
+        return parsed.get("score", 3), parsed.get("reason", "")
+    except Exception as e:
+        print(f"      LLM coherence error: {e}")
+        return 3, "error"
+
+
+def compute_final_score(tag_metrics, sil, llm_coherence):
+    """
+    Final weighted score incorporating LLM coherence (from experiment).
+    Used to re-rank L1 candidates after LLM check.
+    """
+    sil_norm = (sil + 1) / 2
+    llm_norm = llm_coherence / 5.0  # scale 1-5 to 0-1
+    return (
+        FINAL_WEIGHTS["llm_coherence"] * llm_norm
+        + FINAL_WEIGHTS["wos_jaccard"] * tag_metrics["wos_jaccard"]
+        + FINAL_WEIGHTS["concept_coherence"] * tag_metrics["concept_coherence"]
+        + FINAL_WEIGHTS["domain_overlap"] * tag_metrics["domain_overlap"]
+        + FINAL_WEIGHTS["oecd_coherence"] * tag_metrics["oecd_coherence"]
+        + FINAL_WEIGHTS["silhouette"] * sil_norm
+    )
+
+
+def evaluate_l1_with_llm(df, labels, client):
+    """
+    Run LLM coherence check on all clusters of an L1 candidate.
+    Returns weighted-average coherence score (1-5 scale).
+    """
+    cluster_ids = sorted(set(labels))
+    total_score = 0
+    total_weight = 0
+
+    for cid in cluster_ids:
+        mask = labels == cid
+        names = df.loc[mask, "technology_name"].tolist()
+        descs = df.loc[mask, "Technology_Description"].tolist()
+        score, reason = check_cluster_coherence_llm(names, descs, client)
+        weight = mask.sum()
+        total_score += score * weight
+        total_weight += weight
+        time.sleep(0.3)
+
+    return total_score / total_weight if total_weight else 0
+
+
+# ============================================================================
+# CLUSTERING — ALGORITHM SUITE
+# ============================================================================
+
+def try_all_algorithms(embeddings, k_range, n_items):
+    """
+    Try all 5 algorithms across the k range. Return list of (labels, score, description).
+    Automatically skips configurations that don't make sense for the data size.
+    """
+    candidates = []
+
+    for k in k_range:
+        if k >= n_items:
+            continue
+
+        # 1. KMeans
+        try:
+            labels = KMeans(n_clusters=k, n_init=10, random_state=42).fit_predict(embeddings)
+            sil = silhouette_score(embeddings, labels)
+            candidates.append((labels, sil, f"KMeans k={k}"))
+        except Exception:
+            pass
+
+        # 2. Agglomerative (Ward)
+        try:
+            labels = AgglomerativeClustering(n_clusters=k, linkage="ward").fit_predict(embeddings)
+            sil = silhouette_score(embeddings, labels)
+            candidates.append((labels, sil, f"Agglomerative-Ward k={k}"))
+        except Exception:
+            pass
+
+        # 3. GMM
+        try:
+            gmm = GaussianMixture(n_components=k, random_state=42, n_init=3)
+            labels = gmm.fit_predict(embeddings)
+            if len(set(labels)) >= 2:
+                sil = silhouette_score(embeddings, labels)
+                candidates.append((labels, sil, f"GMM k={k}"))
+        except Exception:
+            pass
+
+        # 4. BIRCH
+        try:
+            labels = Birch(n_clusters=k).fit_predict(embeddings)
+            if len(set(labels)) >= 2:
+                sil = silhouette_score(embeddings, labels)
+                candidates.append((labels, sil, f"BIRCH k={k}"))
+        except Exception:
+            pass
+
+        # 5. Spectral (only for smaller groups — slow on large data)
+        if n_items <= 200:
+            try:
+                from sklearn.cluster import SpectralClustering
+                labels = SpectralClustering(
+                    n_clusters=k, affinity="rbf", random_state=42, n_init=10,
+                ).fit_predict(embeddings)
+                sil = silhouette_score(embeddings, labels)
+                candidates.append((labels, sil, f"Spectral k={k}"))
+            except Exception:
+                pass
+
+    # 6. HDBSCAN (parameter-free for k, try a few min_cluster_size values)
+    for ms in [5, 8, 10, 15, 20]:
+        if ms >= n_items // 2:
+            continue
+        try:
+            hdb = HDBSCAN(min_cluster_size=ms, metric="euclidean")
+            labels = hdb.fit_predict(embeddings)
+            # Assign noise to nearest cluster
+            if -1 in labels:
+                valid_clusters = set(labels) - {-1}
+                if not valid_clusters:
+                    continue
+                centers = {c: embeddings[labels == c].mean(axis=0) for c in valid_clusters}
+                for idx in np.where(labels == -1)[0]:
+                    dists = {c: np.linalg.norm(embeddings[idx] - ctr) for c, ctr in centers.items()}
+                    labels[idx] = min(dists, key=dists.get)
+            if len(set(labels)) >= 2:
+                sil = silhouette_score(embeddings, labels)
+                candidates.append((labels, sil, f"HDBSCAN ms={ms}"))
+        except Exception:
+            pass
+
+    return candidates
+
+
+def pick_best_clustering(df, embeddings, k_range):
+    """
+    Pick the best clustering from all algorithms, using the composite score
+    (tag metrics + silhouette). Returns (labels, description, score).
+    """
+    n = len(df)
+    candidates = try_all_algorithms(embeddings, k_range, n)
+
+    if not candidates:
+        return None, "no valid clustering", 0.0
+
+    best_labels = None
+    best_desc = ""
+    best_score = -1
+
+    for labels, sil, desc in candidates:
+        tag_m = compute_tag_metrics(df, labels)
+        score = composite_score(tag_m, sil)
+        if score > best_score:
+            best_score = score
+            best_labels = labels
+            best_desc = desc
+
+    return best_labels, best_desc, best_score
+
+
+# ============================================================================
+# CLUSTER NAMING (Claude)
+# ============================================================================
+
+def name_cluster(tech_names, parent_name, client, existing_names=None):
+    """Name a cluster using Claude on Bedrock, avoiding existing names."""
+    sample = tech_names[:30]
+    list_text = "\n".join(f"- {t}" for t in sample)
+
+    forbidden = (
+        "Do NOT use generic words like: Frontier, Emerging, Exotic, Advanced, "
+        "Novel, Breakthrough, Cutting-edge, Next-gen, Innovative, Future, "
+        "Dual-Use, Other, Miscellaneous, Unconventional, Various, General."
+    )
+
+    avoid = ""
+    if existing_names:
+        names_list = ", ".join(f'"{n}"' for n in existing_names)
+        avoid = f"\nThese names are ALREADY TAKEN by other groups — do NOT reuse them or use very similar names: {names_list}"
 
     if parent_name:
         prompt = f"""Here is a sub-group of technologies under "{parent_name}":
 {list_text}
 
 Task: Provide a short, SPECIFIC Category Name (2-5 words).
-{forbidden}
-The name must describe the TECHNICAL DOMAIN, not how "new" or "advanced" it is.
+{forbidden}{avoid}
+The name must describe the TECHNICAL DOMAIN.
 Output ONLY the category name."""
     else:
         prompt = f"""Here is a list of technologies grouped together:
 {list_text}
 
 Task: Provide a short, SPECIFIC Category Name (2-4 words).
-{forbidden}
-Focus on the TECHNICAL DOMAIN (e.g., "DNA Energy Storage", "Quantum Sensors", "Weather Modification").
+{forbidden}{avoid}
+Focus on the TECHNICAL DOMAIN (e.g., "DNA Energy Storage", "Quantum Sensors").
 Output ONLY the category name."""
 
     try:
         body = json.dumps({
             "anthropic_version": "bedrock-2023-05-31",
             "max_tokens": 100,
-            "messages": [
-                {"role": "user", "content": prompt}
-            ]
+            "messages": [{"role": "user", "content": prompt}],
         })
-
-        response = bedrock_runtime.invoke_model(
+        response = client.invoke_model(
             modelId=TEXT_MODEL_ID,
             body=body,
             contentType="application/json",
-            accept="application/json"
+            accept="application/json",
         )
-
-        result = json.loads(response['body'].read())
-        text = result['content'][0]['text'].strip()
+        result = json.loads(response["body"].read())
+        text = result["content"][0]["text"].strip()
         return text.replace('"', '').replace("Category Name:", "").replace("Category:", "").strip()
     except Exception as e:
-        print(f"Naming error: {e}")
-        return "Unclassified"
+        print(f"   Naming error: {e}")
+        return "Unnamed Group"
 
 
-def check_cluster_coherence(embeddings):
+# ============================================================================
+# MAIN PIPELINE
+# ============================================================================
+
+def run_stage1(df, embeddings, client):
     """
-    בודק את הקוהרנטיות הפנימית של קבוצה
-    מחזיר silhouette score אם אפשר לחלק, אחרת None
+    Stage 1: Find the best L1 grouping.
+    Tries all algorithms across L1_K_RANGE, picks the best by composite score.
     """
-    if len(embeddings) < 4:
-        return None
+    print("=" * 70)
+    print("STAGE 1: Finding best L1 grouping")
+    print(f"   Testing {len(list(L1_K_RANGE))} k values x 5 algorithms + HDBSCAN")
+    print("=" * 70)
 
-    try:
-        # ניסיון חלוקה ל-2 כדי לבדוק קוהרנטיות
-        Z = linkage(embeddings, method='ward')
-        labels = fcluster(Z, t=2, criterion='maxclust')
-        if len(set(labels)) < 2:
-            return None
-        score = silhouette_score(embeddings, labels)
-        return score
-    except:
-        return None
+    labels, desc, score = pick_best_clustering(df, embeddings, L1_K_RANGE)
 
+    if labels is None:
+        print("   ERROR: No valid L1 clustering found!")
+        return None, None, 0
 
-def find_distance_threshold(embeddings, target_clusters_range=(5, 15), mode="normal"):
-    """
-    מוצא את ה-distance threshold שמייצר מספר קבוצות בטווח הרצוי
-    mode="scatter" - יוצר הרבה קבוצות קטנות
-    """
-    Z = linkage(embeddings, method='ward')
-    distances = Z[:, 2]
-
-    # ב-scatter mode, נרצה יותר קבוצות
-    if mode == "scatter":
-        n = len(embeddings)
-        target_clusters_range = (max(n // 4, 3), max(n // 3, 4))
-
-    # חיפוש על distance threshold - מהגבוה לנמוך
-    for dist in sorted(distances, reverse=True):
-        labels = fcluster(Z, t=dist, criterion='distance')
-        n_clusters = len(set(labels))
-        if target_clusters_range[0] <= n_clusters <= target_clusters_range[1]:
-            return Z, dist, n_clusters
-
-    # fallback
-    fallback_dist = np.percentile(distances, 85 if mode == "normal" else 70)
-    labels = fcluster(Z, t=fallback_dist, criterion='distance')
     n_clusters = len(set(labels))
-    return Z, fallback_dist, n_clusters
+    print(f"\n   Best L1: {desc} -> {n_clusters} groups (score={score:.4f})")
+
+    # Show distribution
+    counts = Counter(labels)
+    for cid in sorted(counts):
+        pct = counts[cid] / len(df) * 100
+        print(f"      Cluster {cid}: {counts[cid]} techs ({pct:.1f}%)")
+
+    # Name L1 clusters
+    l1_names = {}
+    for cid in sorted(set(labels)):
+        mask = labels == cid
+        names = df.loc[mask, "technology_name"].tolist()
+        l1_names[cid] = name_cluster(names, None, client)
+        print(f"      Cluster {cid} -> \"{l1_names[cid]}\"")
+        time.sleep(0.3)
+
+    return labels, l1_names, score
 
 
-def should_split_cluster(size, depth, coherence_score=None):
+def run_stage2(df, embeddings, l1_labels, l1_names, client):
     """
-    החלטה משופרת - עם בדיקת קוהרנטיות
-    מחזיר: (should_split, mode)
-    mode: "normal" או "scatter"
+    Stage 2: Sub-cluster each L1 group into L2 sub-groups.
+    Only splits groups >= MIN_CLUSTER_FOR_SPLIT.
+    Returns dict: {l1_id: {l2_id: {"name": str, "indices": list}}}
     """
-    if depth >= MAX_DEPTH:
-        return False, "normal"
+    print("\n" + "=" * 70)
+    print("STAGE 2: Sub-clustering L1 groups into L2")
+    print("=" * 70)
 
-    if size < MIN_LEAF_SIZE * 2:  # קטן מדי לחלוקה (צריך לפחות 6)
-        return False, "normal"
+    l2_structure = {}
 
-    # קבוצה גדולה מדי
-    if size > MAX_LEAF_SIZE:
-        # אם יש מידע על קוהרנטיות והיא נמוכה - scatter mode
-        if coherence_score is not None and coherence_score < COHERENCE_THRESHOLD:
-            return True, "scatter"
-        return True, "normal"
+    for l1_id in sorted(set(l1_labels)):
+        mask = l1_labels == l1_id
+        l1_name = l1_names[l1_id]
+        l1_df = df[mask].reset_index(drop=False)  # keep original index
+        l1_emb = embeddings[mask]
+        n = len(l1_df)
 
-    # בינוני ברמות עליונות
-    if size > 10 and depth < 2:
-        if coherence_score is not None and coherence_score < COHERENCE_THRESHOLD:
-            return True, "scatter"
-        return True, "normal"
+        print(f"\n   L1: \"{l1_name}\" ({n} techs)")
 
-    return False, "normal"
+        if n < MIN_CLUSTER_FOR_SPLIT:
+            print(f"      -> Too small to split, keeping as leaf")
+            l2_structure[l1_id] = {
+                0: {"name": l1_name, "indices": l1_df["index"].tolist()}
+            }
+            continue
+
+        labels, desc, score = pick_best_clustering(l1_df, l1_emb, L2_K_RANGE)
+
+        if labels is None or score < L2_QUALITY_THRESHOLD:
+            print(f"      -> No good L2 split (score={score:.4f}), keeping as leaf")
+            l2_structure[l1_id] = {
+                0: {"name": l1_name, "indices": l1_df["index"].tolist()}
+            }
+            continue
+
+        n_sub = len(set(labels))
+        print(f"      -> {desc}: {n_sub} sub-groups (score={score:.4f})")
+
+        l2_structure[l1_id] = {}
+        l2_names_so_far = []
+        for l2_id in sorted(set(labels)):
+            sub_mask = labels == l2_id
+            sub_names = l1_df.loc[sub_mask, "technology_name"].tolist()
+            sub_indices = l1_df.loc[sub_mask, "index"].tolist()
+            l2_name = name_cluster(sub_names, l1_name, client,
+                                   existing_names=l2_names_so_far)
+            l2_names_so_far.append(l2_name)
+            print(f"         L2.{l2_id}: \"{l2_name}\" ({len(sub_names)} techs)")
+            l2_structure[l1_id][l2_id] = {
+                "name": l2_name,
+                "indices": sub_indices,
+            }
+            time.sleep(0.3)
+
+    return l2_structure
 
 
-def hierarchical_cluster(df, embeddings, depth=0, parent_path="", parent_name=None):
+def run_stage3(df, embeddings, l1_labels, l1_names, l2_structure, client):
     """
-    חלוקה רקורסיבית באמצעות distance-based cutting עם זיהוי קוהרנטיות
-
-    Returns: list of dicts with structure:
-    {
-        'path': 'Bio-Energy/DNA-Based/Proton Storage',
-        'name': 'Proton Storage Systems',
-        'parent': 'DNA-Based Energy',
-        'depth': 3,
-        'size': 8,
-        'tech_indices': [1, 5, 12, ...]
-    }
+    Stage 3 (optional): Further split large L2 groups into L3.
+    Only splits L2 groups >= MIN_CLUSTER_FOR_SPLIT.
+    Returns updated structure with optional L3 level.
     """
-    indent = "  " * depth
-    print(f"{indent}📊 Level {depth}: Analyzing {len(df)} technologies...")
+    print("\n" + "=" * 70)
+    print("STAGE 3: Checking if any L2 group needs further splitting")
+    print("=" * 70)
 
-    # בדיקת קוהרנטיות
-    coherence = check_cluster_coherence(embeddings)
-    if coherence is not None:
-        print(f"{indent}   Coherence score: {coherence:.3f}")
+    l3_structure = {}  # {(l1_id, l2_id): {l3_id: {"name", "indices"}}}
 
-    # תנאי עצירה
-    should_split, split_mode = should_split_cluster(len(df), depth, coherence)
+    for l1_id, l2_groups in l2_structure.items():
+        for l2_id, l2_info in l2_groups.items():
+            indices = l2_info["indices"]
+            n = len(indices)
 
-    if not should_split:
-        print(f"{indent}✋ Keeping as leaf (size={len(df)}, depth={depth})")
-        name = name_cluster_with_ai(df['technology_name'].tolist(), parent_name)
-        return [{
-            'path': f"{parent_path}/{name}" if parent_path else name,
-            'name': name,
-            'parent': parent_name,
-            'depth': depth,
-            'size': len(df),
-            'tech_indices': df.index.tolist(),
-            'silhouette_score': coherence  # שמירת ה-silhouette score
-        }]
+            if n < MIN_CLUSTER_FOR_SPLIT:
+                continue
 
-    # קביעת טווח קבוצות לפי גודל ומצב
-    if split_mode == "scatter":
-        print(f"{indent}🔀 Low coherence detected - using scatter mode")
-        target_range = (max(len(df) // 4, 3), max(len(df) // 3, 4))
-    elif len(df) > 100:
-        target_range = (5, 12)
-    elif len(df) > 50:
-        target_range = (4, 8)
-    else:
-        target_range = (2, 5)
+            l2_name = l2_info["name"]
+            l2_df = df.loc[indices].reset_index(drop=False)
+            l2_emb = embeddings[indices]
 
-    # חישוב linkage וחיתוך
-    Z, dist_threshold, n_clusters = find_distance_threshold(embeddings, target_range, mode=split_mode)
-    labels = fcluster(Z, t=dist_threshold, criterion='distance')
+            labels, desc, score = pick_best_clustering(l2_df, l2_emb, L3_K_RANGE)
 
-    print(f"{indent}✂️  Splitting into {n_clusters} groups (distance={dist_threshold:.2f})")
+            if labels is None or score < L3_QUALITY_THRESHOLD:
+                continue
 
-    df_copy = df.copy()
-    df_copy['temp_cluster'] = labels
+            n_sub = len(set(labels))
+            print(f"   L2 \"{l2_name}\" ({n} techs) -> split into {n_sub} L3 groups (score={score:.4f})")
 
-    all_results = []
+            l3_groups = {}
+            l3_names_so_far = []
+            for l3_id in sorted(set(labels)):
+                sub_mask = labels == l3_id
+                sub_names = l2_df.loc[sub_mask, "technology_name"].tolist()
+                sub_indices = l2_df.loc[sub_mask, "index"].tolist()
+                l3_name = name_cluster(sub_names, l2_name, client,
+                                       existing_names=l3_names_so_far)
+                l3_names_so_far.append(l3_name)
+                print(f"      L3.{l3_id}: \"{l3_name}\" ({len(sub_names)} techs)")
+                l3_groups[l3_id] = {"name": l3_name, "indices": sub_indices}
+                time.sleep(0.3)
 
-    # עיבוד רקורסיבי של כל תת-קבוצה
-    unique_labels = sorted(set(labels))
-    for cluster_id in unique_labels:
-        cluster_mask = df_copy['temp_cluster'] == cluster_id
-        cluster_df = df_copy[cluster_mask].copy()
-        cluster_embeddings = embeddings[cluster_mask.values]
+            l3_structure[(l1_id, l2_id)] = l3_groups
 
-        # מתן שם ראשוני לקבוצה
-        temp_name = name_cluster_with_ai(cluster_df['technology_name'].tolist(), parent_name)
-        new_path = f"{parent_path}/{temp_name}" if parent_path else temp_name
+    if not l3_structure:
+        print("   No L2 groups needed further splitting.")
 
-        print(f"{indent}  📁 Cluster {cluster_id}: {temp_name} ({len(cluster_df)} items)")
+    return l3_structure
 
-        # קריאה רקורסיבית
-        sub_results = hierarchical_cluster(
-            cluster_df,
-            cluster_embeddings,
-            depth + 1,
-            new_path,
-            temp_name
+
+def evaluate_overall_quality(df, l1_labels, l2_structure, embeddings):
+    """Compute overall quality of the two-stage clustering for the correction loop."""
+    # Collect all leaf-level labels
+    leaf_labels = np.full(len(df), -1, dtype=int)
+    label_counter = 0
+
+    for l1_id, l2_groups in l2_structure.items():
+        for l2_id, l2_info in l2_groups.items():
+            for idx in l2_info["indices"]:
+                leaf_labels[idx] = label_counter
+            label_counter += 1
+
+    if len(set(leaf_labels)) < 2:
+        return 0.0
+
+    tag_m = compute_tag_metrics(df, leaf_labels)
+    sil = silhouette_score(embeddings, leaf_labels)
+    return composite_score(tag_m, sil)
+
+
+def consolidate_l1_groups(df, embeddings, l1_labels, l1_names, l2_structure, client,
+                          similarity_threshold=0.80):
+    """
+    Post-Stage-2 refinement: merge L1 groups whose mean embeddings are too similar.
+    This prevents fragmentation like 4 separate bio-energy groups when 2 would suffice.
+
+    Returns updated (l1_labels, l1_names, l2_structure).
+    """
+    from sklearn.metrics.pairwise import cosine_similarity
+
+    print("\n" + "=" * 70)
+    print("L1 CONSOLIDATION: Checking for similar L1 groups to merge")
+    print(f"   Similarity threshold: {similarity_threshold}")
+    print("=" * 70)
+
+    l1_labels = np.array(l1_labels, copy=True)
+    l1_names = dict(l1_names)
+    l2_structure = {k: dict(v) for k, v in l2_structure.items()}  # deep copy
+
+    merged_any = True
+    merge_round = 0
+    while merged_any:
+        merged_any = False
+        merge_round += 1
+        active_ids = sorted(set(l1_labels))
+
+        if len(active_ids) < 2:
+            break
+
+        # Compute centroids for each active L1
+        centroids = {}
+        for cid in active_ids:
+            mask = l1_labels == cid
+            centroids[cid] = embeddings[mask].mean(axis=0)
+
+        # Find the most similar pair
+        best_sim = -1
+        best_pair = None
+        for i, a in enumerate(active_ids):
+            for b in active_ids[i + 1:]:
+                sim = cosine_similarity(
+                    centroids[a].reshape(1, -1),
+                    centroids[b].reshape(1, -1),
+                )[0, 0]
+                if sim > best_sim:
+                    best_sim = sim
+                    best_pair = (a, b)
+
+        if best_sim < similarity_threshold or best_pair is None:
+            print(f"   No pair above threshold (best: {best_sim:.4f}). Done.")
+            break
+
+        a, b = best_pair
+        n_a = (l1_labels == a).sum()
+        n_b = (l1_labels == b).sum()
+        print(f"\n   Round {merge_round}: Merging L1 \"{l1_names[a]}\" ({n_a} techs) "
+              f"+ \"{l1_names[b]}\" ({n_b} techs)  [similarity={best_sim:.4f}]")
+
+        # Merge b into a: update labels
+        old_name_a = l1_names[a]
+        old_name_b = l1_names[b]
+        l1_labels[l1_labels == b] = a
+
+        # Merge L2 structures: append b's sub-groups to a's
+        if b in l2_structure:
+            next_l2_id = max(l2_structure.get(a, {}).keys(), default=-1) + 1
+            for l2_id, l2_info in l2_structure[b].items():
+                l2_structure.setdefault(a, {})[next_l2_id] = l2_info
+                next_l2_id += 1
+            del l2_structure[b]
+
+        # Remove old name for b
+        del l1_names[b]
+
+        # Re-name the merged group with Claude (avoid other L1 names)
+        other_names = [n for cid, n in l1_names.items() if cid != a]
+        merged_techs = df.loc[l1_labels == a, "technology_name"].tolist()
+        new_name = name_cluster(merged_techs, None, client, existing_names=other_names)
+        l1_names[a] = new_name
+        print(f"   -> Merged name: \"{new_name}\" ({len(merged_techs)} techs)")
+        print(f"      (was \"{old_name_a}\" + \"{old_name_b}\")")
+        time.sleep(0.3)
+        merged_any = True
+
+    # Summary
+    active_ids = sorted(set(l1_labels))
+    print(f"\n   After consolidation: {len(active_ids)} L1 groups")
+    for cid in active_ids:
+        n = (l1_labels == cid).sum()
+        pct = n / len(df) * 100
+        print(f"      \"{l1_names[cid]}\": {n} techs ({pct:.1f}%)")
+
+    return l1_labels, l1_names, l2_structure
+
+
+def correction_loop(df, embeddings, client):
+    """
+    Correction loop (matches experiment framework):
+      1. Try all algorithms → score by tag metrics (cheap, ~50 candidates)
+      2. Take top LLM_TOP_N → run LLM coherence check (costs API calls)
+      3. Re-rank by final score (40% LLM + 60% tag metrics)
+      4. Take top MAX_L1_RETRIES → run Stage 2 + L1 consolidation on each
+      5. Pick the best overall
+    """
+    # ── Phase 1: Score all L1 candidates by tag metrics (cheap) ──
+    print("=" * 70)
+    print("PHASE 1: Scoring all L1 candidates by tag metrics")
+    print("=" * 70)
+
+    all_candidates = try_all_algorithms(embeddings, L1_K_RANGE, len(df))
+    print(f"   Generated {len(all_candidates)} clustering candidates")
+
+    scored = []
+    for labels, sil, desc in all_candidates:
+        tag_m = compute_tag_metrics(df, labels)
+        s1_score = composite_score(tag_m, sil)
+        scored.append({
+            "labels": labels, "sil": sil, "desc": desc,
+            "tag_metrics": tag_m, "s1_score": s1_score,
+        })
+    scored.sort(key=lambda x: x["s1_score"], reverse=True)
+
+    print(f"\n   Top 5 by Stage 1 score (tag metrics only):")
+    for i, c in enumerate(scored[:5], 1):
+        k = len(set(c["labels"]))
+        print(f"      {i}. {c['desc']:<30s}  S1={c['s1_score']:.4f}  k={k}")
+
+    # ── Phase 2: LLM coherence check on top N (from experiment) ──
+    top_n = scored[:LLM_TOP_N]
+    print(f"\n{'='*70}")
+    print(f"PHASE 2: LLM Coherence Check on top {len(top_n)} candidates")
+    print("=" * 70)
+
+    for i, c in enumerate(top_n, 1):
+        k = len(set(c["labels"]))
+        print(f"\n   [{i}/{len(top_n)}] {c['desc']} ({k} clusters)")
+        llm_score = evaluate_l1_with_llm(df, c["labels"], client)
+        c["llm_coherence"] = llm_score
+        c["final_score"] = compute_final_score(c["tag_metrics"], c["sil"], llm_score)
+        print(f"      LLM coherence: {llm_score:.2f}/5  |  Final score: {c['final_score']:.4f}")
+
+    # Re-rank by final score
+    top_n.sort(key=lambda x: x["final_score"], reverse=True)
+
+    print(f"\n   Re-ranked by final score (40% LLM + 60% tag metrics):")
+    for i, c in enumerate(top_n[:5], 1):
+        k = len(set(c["labels"]))
+        print(f"      {i}. {c['desc']:<30s}  Final={c['final_score']:.4f}  "
+              f"LLM={c['llm_coherence']:.2f}  S1={c['s1_score']:.4f}  k={k}")
+
+    # ── Phase 3: Stage 2 + consolidation on top candidates ──
+    best_result = None
+    best_quality = -1
+
+    for attempt, candidate in enumerate(top_n[:MAX_L1_RETRIES], 1):
+        l1_labels = candidate["labels"]
+        l1_desc = candidate["desc"]
+        n_clusters = len(set(l1_labels))
+        print(f"\n{'='*70}")
+        print(f"ATTEMPT {attempt}/{MAX_L1_RETRIES}: {l1_desc} ({n_clusters} groups, "
+              f"final={candidate['final_score']:.4f}, LLM={candidate['llm_coherence']:.2f})")
+        print(f"{'='*70}")
+
+        # Name L1 clusters (passing existing names to avoid duplicates)
+        l1_names = {}
+        for cid in sorted(set(l1_labels)):
+            mask = l1_labels == cid
+            names = df.loc[mask, "technology_name"].tolist()
+            l1_names[cid] = name_cluster(names, None, client,
+                                         existing_names=list(l1_names.values()))
+            count = mask.sum()
+            print(f"   L1.{cid}: \"{l1_names[cid]}\" ({count} techs)")
+            time.sleep(0.3)
+
+        # Run Stage 2
+        l2_structure = run_stage2(df, embeddings, l1_labels, l1_names, client)
+
+        # L1 Consolidation: merge similar L1 groups
+        l1_labels, l1_names, l2_structure = consolidate_l1_groups(
+            df, embeddings, l1_labels, l1_names, l2_structure, client
         )
 
-        all_results.extend(sub_results)
+        # Evaluate overall quality (after consolidation)
+        quality = evaluate_overall_quality(df, l1_labels, l2_structure, embeddings)
+        print(f"\n   Overall quality: {quality:.4f}")
 
-    return all_results
+        if quality > best_quality:
+            best_quality = quality
+            best_result = (l1_labels, l1_names, l2_structure, l1_desc)
 
-
-def assign_hierarchical_ids(result_df):
-    """
-    מקצה מספור היררכי לכל רשומה לפי גודל הקבוצות (יורד)
-    """
-    # חישוב גודל לכל רמה
-    level1_sizes = result_df.groupby('category_level_1').size().sort_values(ascending=False)
-    level1_id_map = {cat: str(i+1) for i, cat in enumerate(level1_sizes.index)}
-
-    # מספור Level 2 בתוך כל Level 1
-    level2_id_map = {}
-    for level1_cat in level1_sizes.index:
-        level1_data = result_df[result_df['category_level_1'] == level1_cat]
-        level2_cats = level1_data[level1_data['category_level_2'] != '']['category_level_2'].value_counts()
-        for j, level2_cat in enumerate(level2_cats.index):
-            key = (level1_cat, level2_cat)
-            level2_id_map[key] = f"{level1_id_map[level1_cat]}.{j+1}"
-
-    # מספור Level 3 בתוך כל Level 2
-    level3_id_map = {}
-    for (level1_cat, level2_cat), level2_id in level2_id_map.items():
-        mask = (result_df['category_level_1'] == level1_cat) & (result_df['category_level_2'] == level2_cat)
-        level3_cats = result_df[mask & (result_df['category_level_3'] != '')]['category_level_3'].value_counts()
-        for k, level3_cat in enumerate(level3_cats.index):
-            key = (level1_cat, level2_cat, level3_cat)
-            level3_id_map[key] = f"{level2_id}.{k+1}"
-
-    # מספור Level 4 בתוך כל Level 3
-    level4_id_map = {}
-    for (level1_cat, level2_cat, level3_cat), level3_id in level3_id_map.items():
-        mask = (result_df['category_level_1'] == level1_cat) & \
-               (result_df['category_level_2'] == level2_cat) & \
-               (result_df['category_level_3'] == level3_cat)
-        level4_cats = result_df[mask & (result_df['category_level_4'] != '')]['category_level_4'].value_counts()
-        for m, level4_cat in enumerate(level4_cats.index):
-            key = (level1_cat, level2_cat, level3_cat, level4_cat)
-            level4_id_map[key] = f"{level3_id}.{m+1}"
-
-    # הקצאת המספורים לכל שורה
-    group_ids = []
-    subgroup_ids = []
-    subsubgroup_ids = []
-    subsubsubgroup_ids = []
-    full_numeric_ids = []
-
-    for _, row in result_df.iterrows():
-        l1 = row['category_level_1']
-        l2 = row['category_level_2']
-        l3 = row['category_level_3']
-        l4 = row['category_level_4']
-
-        g_id = level1_id_map.get(l1, '')
-        sg_id = level2_id_map.get((l1, l2), '') if l2 else ''
-        ssg_id = level3_id_map.get((l1, l2, l3), '') if l3 else ''
-        sssg_id = level4_id_map.get((l1, l2, l3, l4), '') if l4 else ''
-
-        # full_numeric_id = המספור המלא עד הרמה האחרונה
-        if sssg_id:
-            full_id = sssg_id
-        elif ssg_id:
-            full_id = ssg_id
-        elif sg_id:
-            full_id = sg_id
+        if quality >= 0.40:
+            print(f"   Quality above threshold — accepting this configuration.")
+            break
         else:
-            full_id = g_id
+            print(f"   Quality below threshold — will try next candidate...")
 
-        group_ids.append(g_id)
-        subgroup_ids.append(sg_id)
-        subsubgroup_ids.append(ssg_id)
-        subsubsubgroup_ids.append(sssg_id)
-        full_numeric_ids.append(full_id)
+    return best_result, best_quality
 
-    result_df['group_id'] = group_ids
-    result_df['subgroup_id'] = subgroup_ids
-    result_df['subsubgroup_id'] = subsubgroup_ids
-    result_df['subsubsubgroup_id'] = subsubsubgroup_ids
-    result_df['full_numeric_id'] = full_numeric_ids
 
+# ============================================================================
+# POST-CLUSTERING REFINEMENT
+# ============================================================================
+
+def _get_all_leaves(l2_structure, l3_structure):
+    """
+    Return a list of (key, indices) for every leaf-level group.
+    key is either ("l2", l1_id, l2_id) or ("l3", l1_id, l2_id, l3_id).
+    """
+    leaves = []
+    for l1_id, l2_groups in l2_structure.items():
+        for l2_id, l2_info in l2_groups.items():
+            l3_groups = l3_structure.get((l1_id, l2_id), {})
+            if l3_groups:
+                for l3_id, l3_info in l3_groups.items():
+                    leaves.append((("l3", l1_id, l2_id, l3_id), l3_info["indices"]))
+            else:
+                leaves.append((("l2", l1_id, l2_id), l2_info["indices"]))
+    return leaves
+
+
+def reassign_orphans(df, embeddings, l1_labels, l2_structure, l3_structure,
+                     distance_factor=1.5, improvement_ratio=0.7):
+    """
+    Post-Stage-3 refinement: detect misplaced techs in small leaf clusters
+    and reassign them to a better-fitting cluster.
+
+    A tech is flagged as an orphan if:
+      - Its cluster has ≤ 3 members
+      - Its distance to cluster centroid > distance_factor * median distance in that cluster
+
+    An orphan is reassigned if:
+      - The nearest other cluster's centroid is significantly closer (ratio < improvement_ratio)
+
+    Returns updated (l2_structure, l3_structure).
+    """
+    from sklearn.metrics.pairwise import cosine_distances
+
+    print("\n" + "=" * 70)
+    print("ORPHAN REASSIGNMENT: Detecting misplaced technologies")
+    print(f"   Distance factor: {distance_factor}x median | Improvement ratio: {improvement_ratio}")
+    print("=" * 70)
+
+    # Deep copy structures
+    l2_structure = {k: {k2: dict(v2) for k2, v2 in v.items()} for k, v in l2_structure.items()}
+    l3_structure = {k: {k2: dict(v2) for k2, v2 in v.items()} for k, v in l3_structure.items()}
+
+    # Collect all leaves with their centroids
+    leaves = _get_all_leaves(l2_structure, l3_structure)
+
+    centroids = {}
+    for key, indices in leaves:
+        if indices:
+            centroids[key] = embeddings[indices].mean(axis=0)
+
+    reassigned = 0
+
+    for key, indices in leaves:
+        if len(indices) > 3 or len(indices) == 0:
+            continue
+
+        centroid = centroids[key]
+        # Compute distances of each tech to its centroid
+        embs = embeddings[indices]
+        dists = cosine_distances(embs, centroid.reshape(1, -1)).flatten()
+        median_dist = np.median(dists)
+
+        for local_i, global_idx in enumerate(indices):
+            if dists[local_i] <= distance_factor * median_dist:
+                continue
+            if median_dist == 0 and dists[local_i] == 0:
+                continue
+
+            tech_name = df.iloc[global_idx]["technology_name"]
+            tech_emb = embeddings[global_idx].reshape(1, -1)
+
+            # Find nearest other leaf
+            best_other_key = None
+            best_other_dist = float("inf")
+            for other_key, other_centroid in centroids.items():
+                if other_key == key:
+                    continue
+                d = cosine_distances(tech_emb, other_centroid.reshape(1, -1))[0, 0]
+                if d < best_other_dist:
+                    best_other_dist = d
+                    best_other_key = other_key
+
+            if best_other_key is None:
+                continue
+
+            current_dist = dists[local_i]
+            ratio = best_other_dist / current_dist if current_dist > 0 else 1.0
+
+            if ratio >= improvement_ratio:
+                continue
+
+            # Perform reassignment
+            # Get target leaf name for logging
+            if best_other_key[0] == "l3":
+                _, tgt_l1, tgt_l2, tgt_l3 = best_other_key
+                target_name = l3_structure[(tgt_l1, tgt_l2)][tgt_l3]["name"]
+            else:
+                _, tgt_l1, tgt_l2 = best_other_key
+                target_name = l2_structure[tgt_l1][tgt_l2]["name"]
+
+            # Get source name
+            if key[0] == "l3":
+                _, src_l1, src_l2, src_l3 = key
+                source_name = l3_structure[(src_l1, src_l2)][src_l3]["name"]
+            else:
+                _, src_l1, src_l2 = key
+                source_name = l2_structure[src_l1][src_l2]["name"]
+
+            print(f"   REASSIGN: \"{tech_name}\"")
+            print(f"      FROM: \"{source_name}\" (dist={current_dist:.4f})")
+            print(f"      TO:   \"{target_name}\" (dist={best_other_dist:.4f}, ratio={ratio:.3f})")
+
+            # Remove from source
+            if key[0] == "l3":
+                _, src_l1, src_l2, src_l3 = key
+                l3_structure[(src_l1, src_l2)][src_l3]["indices"].remove(global_idx)
+            else:
+                _, src_l1, src_l2 = key
+                l2_structure[src_l1][src_l2]["indices"].remove(global_idx)
+
+            # Add to target
+            if best_other_key[0] == "l3":
+                _, tgt_l1, tgt_l2, tgt_l3 = best_other_key
+                l3_structure[(tgt_l1, tgt_l2)][tgt_l3]["indices"].append(global_idx)
+            else:
+                _, tgt_l1, tgt_l2 = best_other_key
+                l2_structure[tgt_l1][tgt_l2]["indices"].append(global_idx)
+
+            # Update l1_labels if the tech moved across L1 groups
+            if key[0] == "l3":
+                src_l1_id = key[1]
+            else:
+                src_l1_id = key[1]
+            if best_other_key[0] == "l3":
+                tgt_l1_id = best_other_key[1]
+            else:
+                tgt_l1_id = best_other_key[1]
+            if src_l1_id != tgt_l1_id:
+                l1_labels[global_idx] = tgt_l1_id
+
+            reassigned += 1
+
+    # Clean up empty leaves
+    for l1_id in list(l2_structure.keys()):
+        for l2_id in list(l2_structure[l1_id].keys()):
+            if not l2_structure[l1_id][l2_id]["indices"]:
+                name = l2_structure[l1_id][l2_id]["name"]
+                print(f"   Removed empty L2 leaf: \"{name}\"")
+                del l2_structure[l1_id][l2_id]
+                if (l1_id, l2_id) in l3_structure:
+                    del l3_structure[(l1_id, l2_id)]
+
+    for key in list(l3_structure.keys()):
+        for l3_id in list(l3_structure[key].keys()):
+            if not l3_structure[key][l3_id]["indices"]:
+                name = l3_structure[key][l3_id]["name"]
+                print(f"   Removed empty L3 leaf: \"{name}\"")
+                del l3_structure[key][l3_id]
+        if not l3_structure[key]:
+            del l3_structure[key]
+
+    print(f"\n   Total reassignments: {reassigned}")
+    return l2_structure, l3_structure
+
+
+def merge_small_leaves(df, embeddings, l1_labels, l1_names, l2_structure, l3_structure,
+                       client, max_leaf_size=2):
+    """
+    Post-refinement: merge leaf clusters with ≤ max_leaf_size techs into their
+    most similar sibling under the same parent.
+
+    Only merges within the same parent — never across L1 groups.
+    Re-names merged clusters via Claude.
+
+    Returns updated (l2_structure, l3_structure).
+    """
+    from sklearn.metrics.pairwise import cosine_similarity
+
+    print("\n" + "=" * 70)
+    print(f"SMALL LEAF MERGING: Consolidating leaves with ≤ {max_leaf_size} techs")
+    print("=" * 70)
+
+    # Deep copy
+    l2_structure = {k: {k2: dict(v2) for k2, v2 in v.items()} for k, v in l2_structure.items()}
+    l3_structure = {k: {k2: dict(v2) for k2, v2 in v.items()} for k, v in l3_structure.items()}
+
+    total_merges = 0
+
+    # --- Pass 1: Merge small L3 leaves within the same L2 parent ---
+    for (l1_id, l2_id) in list(l3_structure.keys()):
+        l3_groups = l3_structure[(l1_id, l2_id)]
+        if len(l3_groups) < 2:
+            continue
+
+        merged_any = True
+        while merged_any:
+            merged_any = False
+            # Find a small leaf
+            small_ids = [l3_id for l3_id, info in l3_groups.items()
+                         if len(info["indices"]) <= max_leaf_size]
+            if not small_ids:
+                break
+
+            for small_id in small_ids:
+                if small_id not in l3_groups:
+                    continue
+                small_info = l3_groups[small_id]
+                small_indices = small_info["indices"]
+                if not small_indices:
+                    continue
+
+                # Find most similar sibling
+                small_centroid = embeddings[small_indices].mean(axis=0).reshape(1, -1)
+                best_sib_id = None
+                best_sim = -1
+                for sib_id, sib_info in l3_groups.items():
+                    if sib_id == small_id or not sib_info["indices"]:
+                        continue
+                    sib_centroid = embeddings[sib_info["indices"]].mean(axis=0).reshape(1, -1)
+                    sim = cosine_similarity(small_centroid, sib_centroid)[0, 0]
+                    if sim > best_sim:
+                        best_sim = sim
+                        best_sib_id = sib_id
+
+                if best_sib_id is None:
+                    continue
+
+                sib_info = l3_groups[best_sib_id]
+                print(f"   MERGE L3: \"{small_info['name']}\" ({len(small_indices)} techs) "
+                      f"-> \"{sib_info['name']}\" ({len(sib_info['indices'])} techs) "
+                      f"[sim={best_sim:.4f}]")
+
+                # Merge
+                sib_info["indices"].extend(small_indices)
+                del l3_groups[small_id]
+
+                # Re-name (avoid sibling names)
+                merged_techs = df.loc[sib_info["indices"], "technology_name"].tolist()
+                parent_name = l2_structure[l1_id][l2_id]["name"]
+                sibling_names = [info["name"] for sid, info in l3_groups.items()
+                                 if sid != best_sib_id]
+                new_name = name_cluster(merged_techs, parent_name, client,
+                                        existing_names=sibling_names)
+                print(f"      -> New name: \"{new_name}\" ({len(sib_info['indices'])} techs)")
+                sib_info["name"] = new_name
+                time.sleep(0.3)
+                total_merges += 1
+                merged_any = True
+
+        # If only one L3 left, collapse it back into L2
+        if len(l3_groups) == 1:
+            remaining_id = list(l3_groups.keys())[0]
+            remaining = l3_groups[remaining_id]
+            l2_structure[l1_id][l2_id]["indices"] = remaining["indices"]
+            l2_structure[l1_id][l2_id]["name"] = remaining["name"]
+            del l3_structure[(l1_id, l2_id)]
+            print(f"      Collapsed single L3 back into L2: \"{remaining['name']}\"")
+
+    # --- Pass 2: Merge small L2 leaves within the same L1 parent ---
+    for l1_id in sorted(l2_structure.keys()):
+        l2_groups = l2_structure[l1_id]
+        if len(l2_groups) < 2:
+            continue
+
+        merged_any = True
+        while merged_any:
+            merged_any = False
+            small_ids = [l2_id for l2_id, info in l2_groups.items()
+                         if len(info["indices"]) <= max_leaf_size
+                         and (l1_id, l2_id) not in l3_structure]  # only leaf L2s
+            if not small_ids:
+                break
+
+            for small_id in small_ids:
+                if small_id not in l2_groups:
+                    continue
+                small_info = l2_groups[small_id]
+                small_indices = small_info["indices"]
+                if not small_indices:
+                    continue
+
+                # Find most similar sibling L2 leaf
+                small_centroid = embeddings[small_indices].mean(axis=0).reshape(1, -1)
+                best_sib_id = None
+                best_sim = -1
+                for sib_id, sib_info in l2_groups.items():
+                    if sib_id == small_id or not sib_info["indices"]:
+                        continue
+                    # Only merge into leaf siblings (no L3 children)
+                    sib_centroid = embeddings[sib_info["indices"]].mean(axis=0).reshape(1, -1)
+                    sim = cosine_similarity(small_centroid, sib_centroid)[0, 0]
+                    if sim > best_sim:
+                        best_sim = sim
+                        best_sib_id = sib_id
+
+                if best_sib_id is None:
+                    continue
+
+                sib_info = l2_groups[best_sib_id]
+                print(f"   MERGE L2: \"{small_info['name']}\" ({len(small_indices)} techs) "
+                      f"-> \"{sib_info['name']}\" ({len(sib_info['indices'])} techs) "
+                      f"[sim={best_sim:.4f}]")
+
+                # Merge indices into sibling
+                sib_info["indices"].extend(small_indices)
+
+                # If sibling has L3 children, add the merged techs as a new L3 group
+                if (l1_id, best_sib_id) in l3_structure:
+                    l3_groups = l3_structure[(l1_id, best_sib_id)]
+                    new_l3_id = max(l3_groups.keys(), default=-1) + 1
+                    l3_groups[new_l3_id] = {
+                        "name": small_info["name"],
+                        "indices": list(small_indices),
+                    }
+
+                del l2_groups[small_id]
+                # Clean up any L3 structure for the deleted L2
+                if (l1_id, small_id) in l3_structure:
+                    del l3_structure[(l1_id, small_id)]
+
+                # Re-name sibling (avoid other L2 names under this L1)
+                merged_techs = df.loc[sib_info["indices"], "technology_name"].tolist()
+                parent_name = l1_names.get(l1_id, "")
+                sibling_names = [info["name"] for sid, info in l2_groups.items()
+                                 if sid != best_sib_id]
+                new_name = name_cluster(merged_techs, parent_name, client,
+                                        existing_names=sibling_names)
+                print(f"      -> New name: \"{new_name}\" ({len(sib_info['indices'])} techs)")
+                sib_info["name"] = new_name
+                time.sleep(0.3)
+                total_merges += 1
+                merged_any = True
+
+    # Summary
+    leaves = _get_all_leaves(l2_structure, l3_structure)
+    size_dist = Counter(len(indices) for _, indices in leaves)
+    print(f"\n   Total merges: {total_merges}")
+    print(f"   Remaining leaves: {len(leaves)}")
+    print(f"   Leaf size distribution: {dict(sorted(size_dist.items()))}")
+
+    return l2_structure, l3_structure
+
+
+# ============================================================================
+# OUTPUT
+# ============================================================================
+
+def build_result_dataframe(df, l1_labels, l1_names, l2_structure, l3_structure):
+    """Build the final DataFrame with hierarchy columns."""
+    rows = []
+    for idx, row in df.iterrows():
+        r = row.to_dict()
+        l1_id = l1_labels[idx]
+        r["category_level_1"] = l1_names[l1_id]
+
+        # Find L2
+        r["category_level_2"] = ""
+        r["category_level_3"] = ""
+
+        for l2_id, l2_info in l2_structure.get(l1_id, {}).items():
+            if idx in l2_info["indices"]:
+                # If this L1 wasn't split, don't repeat the name as L2
+                if len(l2_structure[l1_id]) > 1:
+                    r["category_level_2"] = l2_info["name"]
+
+                # Find L3
+                l3_groups = l3_structure.get((l1_id, l2_id), {})
+                for l3_id, l3_info in l3_groups.items():
+                    if idx in l3_info["indices"]:
+                        r["category_level_3"] = l3_info["name"]
+                        break
+                break
+
+        # Build full path
+        parts = [r["category_level_1"]]
+        if r["category_level_2"]:
+            parts.append(r["category_level_2"])
+        if r["category_level_3"]:
+            parts.append(r["category_level_3"])
+        r["full_path"] = " / ".join(parts)
+        r["leaf_category"] = parts[-1]
+
+        rows.append(r)
+
+    return pd.DataFrame(rows)
+
+
+def assign_ids(result_df):
+    """Assign hierarchical numeric IDs (1, 1.1, 1.1.1)."""
+    # L1 IDs by size
+    l1_sizes = result_df.groupby("category_level_1").size().sort_values(ascending=False)
+    l1_map = {cat: str(i + 1) for i, cat in enumerate(l1_sizes.index)}
+
+    ids = []
+    for _, row in result_df.iterrows():
+        l1 = row["category_level_1"]
+        l2 = row["category_level_2"]
+        l3 = row["category_level_3"]
+        fid = l1_map[l1]
+
+        if l2:
+            # Compute L2 id on the fly
+            l2_cats = result_df[result_df["category_level_1"] == l1]["category_level_2"].value_counts()
+            l2_cats = l2_cats[l2_cats.index != ""]
+            l2_map = {cat: f"{fid}.{j+1}" for j, cat in enumerate(l2_cats.index)}
+            fid = l2_map.get(l2, fid)
+
+            if l3:
+                l3_cats = result_df[
+                    (result_df["category_level_1"] == l1) &
+                    (result_df["category_level_2"] == l2)
+                ]["category_level_3"].value_counts()
+                l3_cats = l3_cats[l3_cats.index != ""]
+                l3_map = {cat: f"{l2_map.get(l2, fid)}.{k+1}" for k, cat in enumerate(l3_cats.index)}
+                fid = l3_map.get(l3, fid)
+
+        ids.append(fid)
+
+    result_df["full_numeric_id"] = ids
     return result_df
 
 
-def build_taxonomy_dataframe(original_df, cluster_results):
-    """
-    בונה DataFrame סופי עם כל המידע ההיררכי
-    שומר את כל העמודות המקוריות
-    """
-    # יצירת מיפוי מאינדקס לקבוצות
-    index_to_cluster = {}
-    for cluster in cluster_results:
-        for idx in cluster['tech_indices']:
-            index_to_cluster[idx] = cluster
+def build_summary(result_df):
+    """Build cluster summary sheet."""
+    rows = []
+    for l1 in result_df["category_level_1"].unique():
+        l1_data = result_df[result_df["category_level_1"] == l1]
+        rows.append({"category": l1, "parent": "-", "level": 1, "tech_count": len(l1_data)})
 
-    # הוספת מידע לדאטה פריים המקורי - שמירת כל העמודות
-    results = []
-    for idx, row in original_df.iterrows():
-        cluster_info = index_to_cluster.get(idx, None)
-        if cluster_info:
-            # שמירת כל העמודות המקוריות
-            result_row = row.to_dict()
+        for l2 in l1_data["category_level_2"].unique():
+            if not l2:
+                continue
+            l2_data = l1_data[l1_data["category_level_2"] == l2]
+            rows.append({"category": l2, "parent": l1, "level": 2, "tech_count": len(l2_data)})
 
-            # הוספת עמודות הסיווג
-            path_parts = cluster_info['path'].split('/')
-            result_row.update({
-                'category_level_1': path_parts[0],
-                'category_level_2': path_parts[1] if len(path_parts) > 1 else '',
-                'category_level_3': path_parts[2] if len(path_parts) > 2 else '',
-                'category_level_4': path_parts[3] if len(path_parts) > 3 else '',
-                'full_path': cluster_info['path'],
-                'leaf_category': cluster_info['name'],
-                'depth': cluster_info['depth'],
-                'cluster_size': cluster_info['size'],
-                'silhouette_score': cluster_info.get('silhouette_score', None)
-            })
-            results.append(result_row)
+            for l3 in l2_data["category_level_3"].unique():
+                if not l3:
+                    continue
+                l3_data = l2_data[l2_data["category_level_3"] == l3]
+                rows.append({"category": l3, "parent": l2, "level": 3, "tech_count": len(l3_data)})
 
-    return pd.DataFrame(results)
+    return pd.DataFrame(rows)
 
 
-def create_summary_sheet(result_df):
-    """
-    יוצר גיליון סיכום עם מבנה הקלאסטרים
-    """
-    summary_rows = []
-
-    # Level 1
-    for level1_cat in result_df['category_level_1'].unique():
-        l1_data = result_df[result_df['category_level_1'] == level1_cat]
-        l1_id = l1_data['group_id'].iloc[0] if 'group_id' in l1_data.columns else ''
-        l1_silhouettes = l1_data['silhouette_score'].dropna()
-        avg_sil = l1_silhouettes.mean() if len(l1_silhouettes) > 0 else None
-
-        summary_rows.append({
-            'numeric_id': l1_id,
-            'category_name': level1_cat,
-            'parent_name': '-',
-            'level': 1,
-            'tech_count': len(l1_data),
-            'avg_silhouette': round(avg_sil, 3) if avg_sil is not None else None
-        })
-
-        # Level 2
-        level2_cats = l1_data[l1_data['category_level_2'] != '']['category_level_2'].unique()
-        for level2_cat in level2_cats:
-            l2_data = l1_data[l1_data['category_level_2'] == level2_cat]
-            l2_id = l2_data['subgroup_id'].iloc[0] if 'subgroup_id' in l2_data.columns else ''
-            l2_silhouettes = l2_data['silhouette_score'].dropna()
-            avg_sil = l2_silhouettes.mean() if len(l2_silhouettes) > 0 else None
-
-            summary_rows.append({
-                'numeric_id': l2_id,
-                'category_name': level2_cat,
-                'parent_name': level1_cat,
-                'level': 2,
-                'tech_count': len(l2_data),
-                'avg_silhouette': round(avg_sil, 3) if avg_sil is not None else None
-            })
-
-            # Level 3
-            level3_cats = l2_data[l2_data['category_level_3'] != '']['category_level_3'].unique()
-            for level3_cat in level3_cats:
-                l3_data = l2_data[l2_data['category_level_3'] == level3_cat]
-                l3_id = l3_data['subsubgroup_id'].iloc[0] if 'subsubgroup_id' in l3_data.columns else ''
-                l3_silhouettes = l3_data['silhouette_score'].dropna()
-                avg_sil = l3_silhouettes.mean() if len(l3_silhouettes) > 0 else None
-
-                summary_rows.append({
-                    'numeric_id': l3_id,
-                    'category_name': level3_cat,
-                    'parent_name': level2_cat,
-                    'level': 3,
-                    'tech_count': len(l3_data),
-                    'avg_silhouette': round(avg_sil, 3) if avg_sil is not None else None
-                })
-
-                # Level 4
-                level4_cats = l3_data[l3_data['category_level_4'] != '']['category_level_4'].unique()
-                for level4_cat in level4_cats:
-                    l4_data = l3_data[l3_data['category_level_4'] == level4_cat]
-                    l4_id = l4_data['subsubsubgroup_id'].iloc[0] if 'subsubsubgroup_id' in l4_data.columns else ''
-                    l4_silhouettes = l4_data['silhouette_score'].dropna()
-                    avg_sil = l4_silhouettes.mean() if len(l4_silhouettes) > 0 else None
-
-                    summary_rows.append({
-                        'numeric_id': l4_id,
-                        'category_name': level4_cat,
-                        'parent_name': level3_cat,
-                        'level': 4,
-                        'tech_count': len(l4_data),
-                        'avg_silhouette': round(avg_sil, 3) if avg_sil is not None else None
-                    })
-
-    summary_df = pd.DataFrame(summary_rows)
-    # מיון לפי numeric_id
-    summary_df = summary_df.sort_values('numeric_id', key=lambda x: x.apply(
-        lambda v: [int(n) for n in str(v).split('.')] if v else [999]
-    )).reset_index(drop=True)
-
-    return summary_df
-
+# ============================================================================
+# MAIN
+# ============================================================================
 
 def main():
-    # 1. טעינת נתונים
     if not os.path.exists(INPUT_FILE):
-        print(f"❌ File {INPUT_FILE} not found.")
+        print(f"ERROR: {INPUT_FILE} not found.")
         return
 
     df = pd.read_csv(INPUT_FILE)
-    print(f"📂 Loaded {len(df)} technologies.\n")
+    print(f"Loaded {len(df)} technologies from {INPUT_FILE}\n")
 
-    # 2. הכנת הטקסט
-    df['embedding_text'] = df.apply(create_clean_context, axis=1)
+    client = create_bedrock_client()
 
-    # 3. יצירת וקטורים (פעם אחת)
-    embeddings_matrix = get_batch_embeddings(df['embedding_text'].tolist())
+    # --- Embeddings ---
+    print("\nGenerating embeddings with Cohere Embed v3...")
+    texts = [compose_text(row) for _, row in df.iterrows()]
+    embeddings = get_embeddings(texts, client)
+    print(f"   Embeddings shape: {embeddings.shape}\n")
 
-    print("\n" + "="*80)
-    print("🌳 Starting Hierarchical Clustering")
-    print("="*80 + "\n")
+    # --- Correction Loop: Stage 1 + Stage 2 ---
+    result, quality = correction_loop(df, embeddings, client)
 
-    # 4. קלאסטרינג היררכי
-    cluster_results = hierarchical_cluster(df, embeddings_matrix)
+    if result is None:
+        print("ERROR: No valid clustering found!")
+        return
 
-    print("\n" + "="*80)
-    print("📊 Clustering Complete!")
-    print("="*80)
-    print(f"Total leaf clusters: {len(cluster_results)}")
+    l1_labels, l1_names, l2_structure, l1_desc = result
 
-    # הצגת סטטיסטיקה
-    depths = [c['depth'] for c in cluster_results]
-    sizes = [c['size'] for c in cluster_results]
-    print(f"Depth range: {min(depths)} to {max(depths)}")
-    print(f"Cluster size range: {min(sizes)} to {max(sizes)}")
-    print(f"Average cluster size: {np.mean(sizes):.1f}")
+    # --- Stage 3 (optional) ---
+    l3_structure = run_stage3(df, embeddings, l1_labels, l1_names, l2_structure, client)
 
-    # 5. בניית DataFrame סופי
-    result_df = build_taxonomy_dataframe(df, cluster_results)
+    # --- Post-clustering refinement ---
+    l2_structure, l3_structure = reassign_orphans(
+        df, embeddings, l1_labels, l2_structure, l3_structure
+    )
+    l2_structure, l3_structure = merge_small_leaves(
+        df, embeddings, l1_labels, l1_names, l2_structure, l3_structure, client
+    )
 
-    # 6. הוספת מספור היררכי
-    result_df = assign_hierarchical_ids(result_df)
+    # --- Build output ---
+    print("\n" + "=" * 70)
+    print("BUILDING OUTPUT")
+    print("=" * 70)
 
-    # 7. יצירת גיליון סיכום
-    summary_df = create_summary_sheet(result_df)
+    result_df = build_result_dataframe(df, l1_labels, l1_names, l2_structure, l3_structure)
+    result_df = assign_ids(result_df)
+    summary_df = build_summary(result_df)
 
-    # 8. שמירה עם 2 גיליונות
-    with pd.ExcelWriter(OUTPUT_FILE, engine='openpyxl') as writer:
-        result_df.to_excel(writer, sheet_name='Technologies', index=False)
-        summary_df.to_excel(writer, sheet_name='Cluster Summary', index=False)
+    # Save
+    with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
+        result_df.to_excel(writer, sheet_name="Technologies", index=False)
+        summary_df.to_excel(writer, sheet_name="Cluster Summary", index=False)
 
-    # הצגת סיכום לפי רמות
-    print("\n" + "="*80)
-    print("📋 Summary by Level")
-    print("="*80)
+    # --- Print summary ---
+    print(f"\nL1 algorithm: {l1_desc}")
+    print(f"Overall quality: {quality:.4f}\n")
 
-    level1_counts = result_df['category_level_1'].value_counts()
-    print(f"\nLevel 1: {len(level1_counts)} categories")
-    for cat, count in level1_counts.head(10).items():
-        print(f"  {cat}: {count} technologies")
+    print("L1 Groups:")
+    l1_counts = result_df["category_level_1"].value_counts()
+    for cat, count in l1_counts.items():
+        pct = count / len(df) * 100
+        print(f"   {cat}: {count} ({pct:.1f}%)")
 
-    print(f"\n✅ Done! Results saved to {OUTPUT_FILE}")
-    print(f"   Use category_level_1 for high-level view")
-    print(f"   Use full_path for complete hierarchy")
-    print(f"   Use leaf_category for most specific classification")
+    total_leaves = result_df["leaf_category"].nunique()
+    print(f"\nTotal leaf categories: {total_leaves}")
+    print(f"Hierarchy depth: {'3 levels' if l3_structure else '2 levels'}")
+    print(f"\nSaved to {OUTPUT_FILE}")
 
 
 if __name__ == "__main__":
