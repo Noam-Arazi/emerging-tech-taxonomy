@@ -263,6 +263,7 @@ Reply with ONLY a JSON object: {{"score": <1-5>, "reason": "<one sentence>"}}"""
         body = json.dumps({
             "anthropic_version": "bedrock-2023-05-31",
             "max_tokens": 150,
+            "temperature": 0,
             "messages": [{"role": "user", "content": prompt}],
         })
         response = client.invoke_model(
@@ -839,12 +840,7 @@ def correction_loop(df, embeddings, client):
         # Run Stage 2
         l2_structure = run_stage2(df, embeddings, l1_labels, l1_names, client)
 
-        # L1 Consolidation: merge similar L1 groups
-        l1_labels, l1_names, l2_structure = consolidate_l1_groups(
-            df, embeddings, l1_labels, l1_names, l2_structure, client
-        )
-
-        # Evaluate overall quality (after consolidation)
+        # Evaluate overall quality
         quality = evaluate_overall_quality(df, l1_labels, l2_structure, embeddings)
         print(f"\n   Overall quality: {quality:.4f}")
 
