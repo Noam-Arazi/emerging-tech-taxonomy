@@ -524,13 +524,24 @@ def name_cluster_bottom_up(items, client, *, is_leaf=True, parent_context=None, 
         items_text = "\n".join(lines)
         context_clause = f' under the parent group "{parent_context}"' if parent_context else ""
 
+        parent_constraint = ""
+        if parent_context:
+            parent_words = ", ".join(f'"{w}"' for w in parent_context.split() if len(w) > 3)
+            parent_constraint = (
+                f"\nThe name MUST be more specific than \"{parent_context}\" "
+                f"and must NOT reuse words already present in that parent name ({parent_words})."
+            )
+
         prompt = f"""You are classifying a group of emerging technologies{context_clause}.
 
 Technologies in this group:
 {items_text}
 
 Task: Identify the shared engineering or scientific mechanism that unites these technologies.
-{forbidden}{avoid}
+Focus on the most specific technical discriminator — storage mechanism, energy carrier, process type,
+or application domain. If the group contains both supercapacitors and batteries, name the dominant
+storage type explicitly.
+{forbidden}{avoid}{parent_constraint}
 
 Return ONLY a valid JSON object — no extra text, no markdown:
 {{
@@ -543,12 +554,19 @@ Return ONLY a valid JSON object — no extra text, no markdown:
         items_text = "\n".join(lines)
         context_clause = f' under the parent group "{parent_context}"' if parent_context else ""
 
+        subgroup_words = set()
+        for item in items:
+            subgroup_words.update(item["cluster_name"].split())
+        common_words = ", ".join(f'"{w}"' for w in sorted(subgroup_words) if len(w) > 3)
+
         prompt = f"""You are classifying sub-groups of technologies{context_clause}.
 
 Sub-groups and their summaries:
 {items_text}
 
-Task: Find the higher-level concept that abstracts over ALL these sub-groups. The name must be broader than any individual sub-group but still technically specific — not generic.
+Task: Find the higher-level concept that abstracts over ALL these sub-groups. The name must be
+broader than any individual sub-group but still technically specific — not generic.
+The name must be meaningfully different from any of the sub-group names listed above.
 {forbidden}{avoid}
 
 Return ONLY a valid JSON object — no extra text, no markdown:
