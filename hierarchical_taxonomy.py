@@ -836,20 +836,15 @@ def run_stage2(df, embeddings, l1_labels, l1_names, client):
         print(f"      -> {desc}: {n_sub} sub-groups (score={score:.4f})")
 
         l2_structure[l1_id] = {}
-        l2_names_so_far = []
         for l2_id in sorted(set(labels)):
             sub_mask = labels == l2_id
-            sub_names = l1_df.loc[sub_mask, "technology_name"].tolist()
             sub_indices = l1_df.loc[sub_mask, "index"].tolist()
-            l2_name = name_cluster(sub_names, l1_name, client,
-                                   existing_names=l2_names_so_far)
-            l2_names_so_far.append(l2_name)
-            print(f"         L2.{l2_id}: \"{l2_name}\" ({len(sub_names)} techs)")
+            l2_name = f"Cluster_{l2_id}"
+            print(f"         L2.{l2_id}: {len(sub_indices)} techs")
             l2_structure[l1_id][l2_id] = {
                 "name": l2_name,
                 "indices": sub_indices,
             }
-            time.sleep(0.3)
 
     return l2_structure
 
@@ -887,17 +882,12 @@ def run_stage3(df, embeddings, l1_labels, l1_names, l2_structure, client):
             print(f"   L2 \"{l2_name}\" ({n} techs) -> split into {n_sub} L3 groups (score={score:.4f})")
 
             l3_groups = {}
-            l3_names_so_far = []
             for l3_id in sorted(set(labels)):
                 sub_mask = labels == l3_id
-                sub_names = l2_df.loc[sub_mask, "technology_name"].tolist()
                 sub_indices = l2_df.loc[sub_mask, "index"].tolist()
-                l3_name = name_cluster(sub_names, l2_name, client,
-                                       existing_names=l3_names_so_far)
-                l3_names_so_far.append(l3_name)
-                print(f"      L3.{l3_id}: \"{l3_name}\" ({len(sub_names)} techs)")
+                l3_name = f"Cluster_{l3_id}"
+                print(f"      L3.{l3_id}: {len(sub_indices)} techs")
                 l3_groups[l3_id] = {"name": l3_name, "indices": sub_indices}
-                time.sleep(0.3)
 
             l3_structure[(l1_id, l2_id)] = l3_groups
 
@@ -1090,16 +1080,13 @@ def correction_loop(df, embeddings, client):
               f"final={candidate['final_score']:.4f}, LLM={candidate['llm_coherence']:.2f})")
         print(f"{'='*70}")
 
-        # Name L1 clusters (passing existing names to avoid duplicates)
+        # Assign placeholder names (final names set in bottom-up naming phase)
         l1_names = {}
         for cid in sorted(set(l1_labels)):
             mask = l1_labels == cid
-            names = df.loc[mask, "technology_name"].tolist()
-            l1_names[cid] = name_cluster(names, None, client,
-                                         existing_names=list(l1_names.values()))
             count = mask.sum()
-            print(f"   L1.{cid}: \"{l1_names[cid]}\" ({count} techs)")
-            time.sleep(0.3)
+            l1_names[cid] = f"Cluster_{cid}"
+            print(f"   L1.{cid}: {count} techs")
 
         # Run Stage 2
         l2_structure = run_stage2(df, embeddings, l1_labels, l1_names, client)
@@ -1361,17 +1348,7 @@ def merge_small_leaves(df, embeddings, l1_labels, l1_names, l2_structure, l3_str
                 # Merge
                 sib_info["indices"].extend(small_indices)
                 del l3_groups[small_id]
-
-                # Re-name (avoid sibling names)
-                merged_techs = df.loc[sib_info["indices"], "technology_name"].tolist()
-                parent_name = l2_structure[l1_id][l2_id]["name"]
-                sibling_names = [info["name"] for sid, info in l3_groups.items()
-                                 if sid != best_sib_id]
-                new_name = name_cluster(merged_techs, parent_name, client,
-                                        existing_names=sibling_names)
-                print(f"      -> New name: \"{new_name}\" ({len(sib_info['indices'])} techs)")
-                sib_info["name"] = new_name
-                time.sleep(0.3)
+                print(f"      -> Merged into \"{sib_info['name']}\" ({len(sib_info['indices'])} techs)")
                 total_merges += 1
                 merged_any = True
 
@@ -1446,16 +1423,7 @@ def merge_small_leaves(df, embeddings, l1_labels, l1_names, l2_structure, l3_str
                 if (l1_id, small_id) in l3_structure:
                     del l3_structure[(l1_id, small_id)]
 
-                # Re-name sibling (avoid other L2 names under this L1)
-                merged_techs = df.loc[sib_info["indices"], "technology_name"].tolist()
-                parent_name = l1_names.get(l1_id, "")
-                sibling_names = [info["name"] for sid, info in l2_groups.items()
-                                 if sid != best_sib_id]
-                new_name = name_cluster(merged_techs, parent_name, client,
-                                        existing_names=sibling_names)
-                print(f"      -> New name: \"{new_name}\" ({len(sib_info['indices'])} techs)")
-                sib_info["name"] = new_name
-                time.sleep(0.3)
+                print(f"      -> Merged into \"{sib_info['name']}\" ({len(sib_info['indices'])} techs)")
                 total_merges += 1
                 merged_any = True
 
@@ -1549,16 +1517,28 @@ def assign_ids(result_df):
 
 
 def build_summary(result_df, summaries=None):
-    """Build cluster summary sheet, including per-cluster summaries if provided."""
+    """Build cluster summary sheet with hierarchical IDs and per-cluster summaries."""
     if summaries is None:
         summaries = {}
+
+    # Build category name → hierarchical numeric ID mapping from result_df
+    id_map = {}
+    for _, row in result_df.drop_duplicates(["category_level_1"]).iterrows():
+        id_map[row["category_level_1"]] = row["full_numeric_id"].split(".")[0]
+    l2_rows = result_df[result_df["category_level_2"] != ""].drop_duplicates(["category_level_2"])
+    for _, row in l2_rows.iterrows():
+        parts = row["full_numeric_id"].split(".")
+        id_map[row["category_level_2"]] = ".".join(parts[:2])
+    l3_rows = result_df[result_df["category_level_3"] != ""].drop_duplicates(["category_level_3"])
+    for _, row in l3_rows.iterrows():
+        id_map[row["category_level_3"]] = row["full_numeric_id"]
+
     rows = []
     for l1 in result_df["category_level_1"].unique():
         l1_data = result_df[result_df["category_level_1"] == l1]
         rows.append({
-            "category": l1, "parent": "-", "level": 1,
-            "tech_count": len(l1_data),
-            "summary": summaries.get(l1, ""),
+            "id": id_map.get(l1, ""), "category": l1, "parent": "-",
+            "level": 1, "tech_count": len(l1_data), "summary": summaries.get(l1, ""),
         })
 
         for l2 in l1_data["category_level_2"].unique():
@@ -1566,9 +1546,8 @@ def build_summary(result_df, summaries=None):
                 continue
             l2_data = l1_data[l1_data["category_level_2"] == l2]
             rows.append({
-                "category": l2, "parent": l1, "level": 2,
-                "tech_count": len(l2_data),
-                "summary": summaries.get(l2, ""),
+                "id": id_map.get(l2, ""), "category": l2, "parent": l1,
+                "level": 2, "tech_count": len(l2_data), "summary": summaries.get(l2, ""),
             })
 
             for l3 in l2_data["category_level_3"].unique():
@@ -1576,9 +1555,8 @@ def build_summary(result_df, summaries=None):
                     continue
                 l3_data = l2_data[l2_data["category_level_3"] == l3]
                 rows.append({
-                    "category": l3, "parent": l2, "level": 3,
-                    "tech_count": len(l3_data),
-                    "summary": summaries.get(l3, ""),
+                    "id": id_map.get(l3, ""), "category": l3, "parent": l2,
+                    "level": 3, "tech_count": len(l3_data), "summary": summaries.get(l3, ""),
                 })
 
     return pd.DataFrame(rows)
