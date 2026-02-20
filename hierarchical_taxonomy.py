@@ -490,6 +490,270 @@ Output ONLY the category name."""
         return "Unnamed Group"
 
 
+def name_cluster_bottom_up(items, client, *, is_leaf=True, parent_context=None, existing_names=None):
+    """
+    Bottom-up cluster naming using Claude.
+
+    For leaf nodes (is_leaf=True):
+        items = [{"name": str, "description": str}, ...]
+        LLM receives raw technology data and extracts the shared engineering mechanism.
+
+    For parent nodes (is_leaf=False):
+        items = [{"cluster_name": str, "summary": str}, ...]
+        LLM receives child summaries and abstracts upward to a broader concept.
+
+    Returns: {"cluster_name": str, "summary": str}
+    """
+    if not items:
+        return {"cluster_name": "Unnamed Group", "summary": ""}
+
+    forbidden = (
+        "Do NOT use generic words like: Frontier, Emerging, Exotic, Advanced, "
+        "Novel, Breakthrough, Cutting-edge, Next-gen, Innovative, Future, "
+        "Dual-Use, Other, Miscellaneous, Unconventional, Various, General."
+    )
+
+    avoid = ""
+    if existing_names:
+        names_list = ", ".join(f'"{n}"' for n in existing_names)
+        avoid = f"\nThese names are ALREADY TAKEN — do NOT reuse or produce very similar names: {names_list}"
+
+    if is_leaf:
+        sample = items[:30]
+        lines = [f"- {item['name']}: {str(item['description'])[:200]}" for item in sample]
+        items_text = "\n".join(lines)
+        context_clause = f' under the parent group "{parent_context}"' if parent_context else ""
+
+        prompt = f"""You are classifying a group of emerging technologies{context_clause}.
+
+Technologies in this group:
+{items_text}
+
+Task: Identify the shared engineering or scientific mechanism that unites these technologies.
+{forbidden}{avoid}
+
+Return ONLY a valid JSON object — no extra text, no markdown:
+{{
+  "cluster_name": "<specific 2-5 word name describing the shared technical mechanism or domain>",
+  "summary": "<1-2 sentences explaining the common thread that unites these technologies>"
+}}"""
+
+    else:
+        lines = [f"- {item['cluster_name']}: {item['summary']}" for item in items]
+        items_text = "\n".join(lines)
+        context_clause = f' under the parent group "{parent_context}"' if parent_context else ""
+
+        prompt = f"""You are classifying sub-groups of technologies{context_clause}.
+
+Sub-groups and their summaries:
+{items_text}
+
+Task: Find the higher-level concept that abstracts over ALL these sub-groups. The name must be broader than any individual sub-group but still technically specific — not generic.
+{forbidden}{avoid}
+
+Return ONLY a valid JSON object — no extra text, no markdown:
+{{
+  "cluster_name": "<specific 2-5 word name for the overarching technical domain>",
+  "summary": "<1-2 sentences explaining what unifies these sub-groups at a higher level of abstraction>"
+}}"""
+
+    try:
+        body = json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 250,
+            "temperature": 0,
+            "messages": [{"role": "user", "content": prompt}],
+        })
+        response = client.invoke_model(
+            modelId=TEXT_MODEL_ID,
+            body=body,
+            contentType="application/json",
+            accept="application/json",
+        )
+        result = json.loads(response["body"].read())
+        text = result["content"][0]["text"].strip()
+
+        # Strip markdown code fences if Claude wraps the JSON
+        if text.startswith("```"):
+            parts = text.split("```")
+            text = parts[1] if len(parts) > 1 else text
+            if text.startswith("json"):
+                text = text[4:]
+            text = text.strip()
+
+        parsed = json.loads(text)
+        cluster_name = str(parsed.get("cluster_name", "Unnamed Group")).strip().strip('"')
+        summary = str(parsed.get("summary", "")).strip()
+        return {"cluster_name": cluster_name, "summary": summary}
+
+    except Exception as e:
+        print(f"   Naming error: {e}")
+        return {"cluster_name": "Unnamed Group", "summary": ""}
+
+
+def name_all_clusters_bottom_up(df, l1_labels, l1_names, l2_structure, l3_structure, client):
+    """
+    Bottom-up naming phase: names all clusters from leaves up to root.
+
+    Called once, after the tree is fully finalized (post merge_small_leaves).
+    Overwrites the "name" field in all structures with bottom-up names and
+    adds a "summary" field to every cluster.
+
+    Naming order:
+      1a. L3 leaf nodes       — named from raw tech data (name + description)
+      1b. L2 leaf nodes       — named from raw tech data (no L3 children)
+      2.  L2 parent nodes     — named by abstracting over L3 summaries
+      3.  L1 nodes            — named by abstracting over L2 summaries
+                                (or from raw tech data if L1 was not split)
+
+    Returns: (l1_names, l1_summaries, l2_structure, l3_structure)
+      l1_names     — {l1_id: str}  updated L1 names
+      l1_summaries — {l1_id: str}  new per-L1 summaries
+    """
+    print("\n" + "=" * 70)
+    print("BOTTOM-UP NAMING PHASE")
+    print("=" * 70)
+
+    # Track names accumulated per L1 parent (for intra-L1 deduplication)
+    l2_names_by_l1 = {l1_id: [] for l1_id in l2_structure}
+
+    # ── Step 1a: Name L3 leaf nodes ────────────────────────────────────────
+    print("\n   Step 1: Naming leaf nodes with raw technology data...")
+
+    for (l1_id, l2_id), l3_groups in l3_structure.items():
+        l2_name = l2_structure[l1_id][l2_id].get("name", "")
+        existing = []
+
+        for l3_id in sorted(l3_groups.keys()):
+            l3_info = l3_groups[l3_id]
+            tech_items = [
+                {"name": str(df.loc[idx]["technology_name"]),
+                 "description": str(df.loc[idx]["Technology_Description"])}
+                for idx in l3_info["indices"]
+            ]
+            result = name_cluster_bottom_up(
+                tech_items, client,
+                is_leaf=True,
+                parent_context=l2_name,
+                existing_names=existing,
+            )
+            l3_info["name"] = result["cluster_name"]
+            l3_info["summary"] = result["summary"]
+            existing.append(result["cluster_name"])
+            print(f"      L3 [{l1_id}.{l2_id}.{l3_id}]: \"{result['cluster_name']}\""
+                  f"  ({len(l3_info['indices'])} techs)")
+            time.sleep(0.3)
+
+    # ── Step 1b: Name L2 leaf nodes (no L3 children) ───────────────────────
+    for l1_id, l2_groups in l2_structure.items():
+        l1_parent_name = l1_names.get(l1_id, "")
+        has_split = len(l2_groups) > 1
+
+        for l2_id in sorted(l2_groups.keys()):
+            if (l1_id, l2_id) in l3_structure:
+                continue  # Has L3 children — handled in step 2
+            l2_info = l2_groups[l2_id]
+            tech_items = [
+                {"name": str(df.loc[idx]["technology_name"]),
+                 "description": str(df.loc[idx]["Technology_Description"])}
+                for idx in l2_info["indices"]
+            ]
+            result = name_cluster_bottom_up(
+                tech_items, client,
+                is_leaf=True,
+                parent_context=l1_parent_name if has_split else None,
+                existing_names=l2_names_by_l1[l1_id],
+            )
+            l2_info["name"] = result["cluster_name"]
+            l2_info["summary"] = result["summary"]
+            l2_names_by_l1[l1_id].append(result["cluster_name"])
+            label = "L2 leaf" if has_split else "L2 (unsplit L1)"
+            print(f"      {label} [{l1_id}.{l2_id}]: \"{result['cluster_name']}\""
+                  f"  ({len(l2_info['indices'])} techs)")
+            time.sleep(0.3)
+
+    # ── Step 2: Name L2 parent nodes using L3 summaries ────────────────────
+    print("\n   Step 2: Naming L2 parent nodes from L3 summaries...")
+
+    for l1_id, l2_groups in l2_structure.items():
+        l1_parent_name = l1_names.get(l1_id, "")
+
+        for l2_id in sorted(l2_groups.keys()):
+            if (l1_id, l2_id) not in l3_structure:
+                continue  # Leaf — already named in step 1
+            l2_info = l2_groups[l2_id]
+            l3_groups = l3_structure[(l1_id, l2_id)]
+            child_items = [
+                {"cluster_name": l3_groups[l3_id]["name"],
+                 "summary": l3_groups[l3_id].get("summary", "")}
+                for l3_id in sorted(l3_groups.keys())
+            ]
+            result = name_cluster_bottom_up(
+                child_items, client,
+                is_leaf=False,
+                parent_context=l1_parent_name,
+                existing_names=l2_names_by_l1[l1_id],
+            )
+            l2_info["name"] = result["cluster_name"]
+            l2_info["summary"] = result["summary"]
+            l2_names_by_l1[l1_id].append(result["cluster_name"])
+            print(f"      L2 parent [{l1_id}.{l2_id}]: \"{result['cluster_name']}\""
+                  f"  ({len(l2_info['indices'])} techs)")
+            time.sleep(0.3)
+
+    # ── Step 3: Name L1 nodes ──────────────────────────────────────────────
+    print("\n   Step 3: Naming L1 nodes from L2 summaries...")
+
+    l1_summaries = {}
+    l1_existing = []
+
+    # Largest L1 group first (consistent ordering)
+    l1_ids_sorted = sorted(
+        set(l1_labels),
+        key=lambda cid: int((l1_labels == cid).sum()),
+        reverse=True,
+    )
+
+    for l1_id in l1_ids_sorted:
+        l2_groups = l2_structure.get(l1_id, {})
+
+        if len(l2_groups) > 1:
+            # L1 was split — abstract over L2 summaries
+            child_items = [
+                {"cluster_name": l2_groups[l2_id]["name"],
+                 "summary": l2_groups[l2_id].get("summary", "")}
+                for l2_id in sorted(l2_groups.keys())
+            ]
+            result = name_cluster_bottom_up(
+                child_items, client,
+                is_leaf=False,
+                existing_names=l1_existing,
+            )
+        else:
+            # L1 not split — name directly from raw tech data
+            indices = list(l2_groups.values())[0]["indices"] if l2_groups else []
+            tech_items = [
+                {"name": str(df.loc[idx]["technology_name"]),
+                 "description": str(df.loc[idx]["Technology_Description"])}
+                for idx in indices[:30]
+            ]
+            result = name_cluster_bottom_up(
+                tech_items, client,
+                is_leaf=True,
+                existing_names=l1_existing,
+            )
+
+        l1_names[l1_id] = result["cluster_name"]
+        l1_summaries[l1_id] = result["summary"]
+        l1_existing.append(result["cluster_name"])
+        n = int((l1_labels == l1_id).sum())
+        print(f"      L1 [{l1_id}]: \"{result['cluster_name']}\"  ({n} techs)")
+        time.sleep(0.3)
+
+    print("\n   Bottom-up naming complete.")
+    return l1_names, l1_summaries, l2_structure, l3_structure
+
+
 # ============================================================================
 # MAIN PIPELINE
 # ============================================================================
@@ -1284,24 +1548,38 @@ def assign_ids(result_df):
     return result_df
 
 
-def build_summary(result_df):
-    """Build cluster summary sheet."""
+def build_summary(result_df, summaries=None):
+    """Build cluster summary sheet, including per-cluster summaries if provided."""
+    if summaries is None:
+        summaries = {}
     rows = []
     for l1 in result_df["category_level_1"].unique():
         l1_data = result_df[result_df["category_level_1"] == l1]
-        rows.append({"category": l1, "parent": "-", "level": 1, "tech_count": len(l1_data)})
+        rows.append({
+            "category": l1, "parent": "-", "level": 1,
+            "tech_count": len(l1_data),
+            "summary": summaries.get(l1, ""),
+        })
 
         for l2 in l1_data["category_level_2"].unique():
             if not l2:
                 continue
             l2_data = l1_data[l1_data["category_level_2"] == l2]
-            rows.append({"category": l2, "parent": l1, "level": 2, "tech_count": len(l2_data)})
+            rows.append({
+                "category": l2, "parent": l1, "level": 2,
+                "tech_count": len(l2_data),
+                "summary": summaries.get(l2, ""),
+            })
 
             for l3 in l2_data["category_level_3"].unique():
                 if not l3:
                     continue
                 l3_data = l2_data[l2_data["category_level_3"] == l3]
-                rows.append({"category": l3, "parent": l2, "level": 3, "tech_count": len(l3_data)})
+                rows.append({
+                    "category": l3, "parent": l2, "level": 3,
+                    "tech_count": len(l3_data),
+                    "summary": summaries.get(l3, ""),
+                })
 
     return pd.DataFrame(rows)
 
@@ -1346,6 +1624,22 @@ def main():
         df, embeddings, l1_labels, l1_names, l2_structure, l3_structure, client
     )
 
+    # --- Bottom-up naming phase (runs after tree is fully finalized) ---
+    l1_names, l1_summaries, l2_structure, l3_structure = name_all_clusters_bottom_up(
+        df, l1_labels, l1_names, l2_structure, l3_structure, client
+    )
+
+    # Build name → summary lookup for the summary sheet
+    summaries = {}
+    for l1_id, name in l1_names.items():
+        summaries[name] = l1_summaries.get(l1_id, "")
+    for l1_id, l2_groups in l2_structure.items():
+        for l2_id, l2_info in l2_groups.items():
+            summaries[l2_info["name"]] = l2_info.get("summary", "")
+    for (l1_id, l2_id), l3_groups in l3_structure.items():
+        for l3_id, l3_info in l3_groups.items():
+            summaries[l3_info["name"]] = l3_info.get("summary", "")
+
     # --- Build output ---
     print("\n" + "=" * 70)
     print("BUILDING OUTPUT")
@@ -1353,7 +1647,7 @@ def main():
 
     result_df = build_result_dataframe(df, l1_labels, l1_names, l2_structure, l3_structure)
     result_df = assign_ids(result_df)
-    summary_df = build_summary(result_df)
+    summary_df = build_summary(result_df, summaries=summaries)
 
     # Save
     with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
