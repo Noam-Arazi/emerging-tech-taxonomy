@@ -39,6 +39,21 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# Change primary button color to blue
+st.markdown("""
+<style>
+button[kind="primary"] {
+    background-color: #0066cc !important;
+    border-color: #0066cc !important;
+    color: white !important;
+}
+button[kind="primary"]:hover {
+    background-color: #0052a3 !important;
+    border-color: #0052a3 !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
 # ============================================================================
 # SIDEBAR — AWS CREDENTIALS
 # ============================================================================
@@ -94,12 +109,6 @@ if uploaded_file is not None:
     if missing:
         st.error(f"Missing required columns: {', '.join(missing)}")
         st.stop()
-
-    optional = ["Web_of_Science_Category", "OECD_Research_Area",
-                "emerging_tech_concepts", "applied_domain"]
-    present = [c for c in optional if c in df.columns]
-    if present:
-        st.info(f"Enrichment columns found: {', '.join(present)}")
 
     # ========================================================================
     # CLASSIFY BUTTON
@@ -250,8 +259,8 @@ with tab_tree:
         st.rerun()
 
     for i, name in enumerate(nav_path):
-        label = (name[:18] + "…") if len(name) > 18 else name
-        if crumb_cols[i + 1].button(f"▸ {label}", key=f"bc_{i}"):
+        level_prefix = f"L{i + 1}"
+        if crumb_cols[i + 1].button(f"▸ {level_prefix}: {name}", key=f"bc_{i}"):
             st.session_state["nav_path"] = nav_path[: i + 1]
             st.rerun()
 
@@ -260,6 +269,13 @@ with tab_tree:
     # ── Current level: find children ─────────────────────────────────────────
     current_parent = nav_path[-1] if nav_path else "-"
     children = summary_df[summary_df["parent"] == current_parent].copy()
+    # Natural sort: "10" > "2" numerically, not lexicographically
+    children = children.iloc[
+        sorted(
+            range(len(children)),
+            key=lambda i: [int(p) for p in str(children.iloc[i]["id"]).split(".") if p.isdigit()],
+        )
+    ]
 
     if len(children) > 0:
         # ── Show sub-group cards ──────────────────────────────────────────────
