@@ -1581,6 +1581,157 @@ def build_summary(result_df, summaries=None):
 
 
 # ============================================================================
+# EXCEL OUTPUT
+# ============================================================================
+
+_PASTEL_PALETTE = [
+    "FFF2CC", "D5E8D4", "DAE8FC", "FFE6CC", "E1D5E7",
+    "F8CECC", "D0E0E3", "FFF8E7", "E8F5E9", "FCE4EC",
+    "E3F2FD", "FFF9C4", "F3E5F5", "E0F7FA", "FBE9E7",
+    "EDE7F6", "E8EAF6", "E0F2F1", "F1F8E9", "FFF3E0",
+]
+
+
+def _build_leaf_color_map(result_df):
+    """Map each leaf_category to a pastel hex color, in natural-sort order."""
+    def _nat_key(id_str):
+        return [int(p) for p in str(id_str).split(".") if p.isdigit()]
+
+    sorted_df = result_df.sort_values(
+        "full_numeric_id", key=lambda s: s.map(_nat_key)
+    )
+    color_map = {}
+    for leaf in sorted_df["leaf_category"]:
+        if leaf not in color_map:
+            color_map[leaf] = _PASTEL_PALETTE[len(color_map) % len(_PASTEL_PALETTE)]
+    return color_map
+
+
+def _style_cluster_summary(ws, summary_sorted, leaf_color_map):
+    """Apply pastel fill to leaf rows in the Cluster Summary sheet."""
+    from openpyxl.styles import PatternFill
+
+    parents = set(summary_sorted["parent"].dropna())
+    for row_idx, (_, row) in enumerate(summary_sorted.iterrows(), start=2):
+        category = row["category"]
+        if category not in parents:
+            color = leaf_color_map.get(category)
+            if color:
+                fill = PatternFill("solid", fgColor=color)
+                for col in range(1, len(summary_sorted.columns) + 1):
+                    ws.cell(row=row_idx, column=col).fill = fill
+
+
+def _write_overview_sheet(ws, result_df, leaf_color_map):
+    """Write the styled Overview sheet into an openpyxl Worksheet."""
+    from openpyxl.styles import PatternFill, Font, Alignment
+
+    L1_FILL  = PatternFill("solid", fgColor="1F3864")
+    L1_FONT  = Font(bold=True, color="FFFFFF", size=13)
+    L1_ALIGN = Alignment(horizontal="left", vertical="center", indent=0)
+
+    L2_FILL  = PatternFill("solid", fgColor="2F75B6")
+    L2_FONT  = Font(bold=True, color="FFFFFF", size=11)
+    L2_ALIGN = Alignment(horizontal="left", vertical="center", indent=1)
+
+    L3_FILL  = PatternFill("solid", fgColor="BDD7EE")
+    L3_FONT  = Font(bold=True, color="1F3864", size=10)
+    L3_ALIGN = Alignment(horizontal="left", vertical="center", indent=2)
+
+    HDR_FILL  = PatternFill("solid", fgColor="D9D9D9")
+    HDR_FONT  = Font(bold=True, size=11)
+    TECH_FONT = Font(size=10)
+
+    ws.column_dimensions["A"].width = 10
+    ws.column_dimensions["B"].width = 40
+    ws.column_dimensions["C"].width = 80
+
+    for col, text in enumerate(["מס׳", "שם הטכנולוגיה", "תיאור"], start=1):
+        cell = ws.cell(row=1, column=col, value=text)
+        cell.fill = HDR_FILL
+        cell.font = HDR_FONT
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    ws.freeze_panes = "A2"
+
+    def _nat_key(id_str):
+        return [int(p) for p in str(id_str).split(".") if p.isdigit()]
+
+    sorted_df = result_df.sort_values(
+        "full_numeric_id", key=lambda s: s.map(_nat_key)
+    ).reset_index(drop=True)
+
+    def _header_row(row_num, id_text, name, fill, font, align, height=22):
+        ws.merge_cells(start_row=row_num, start_column=1, end_row=row_num, end_column=3)
+        cell = ws.cell(row=row_num, column=1, value=f"{id_text}  {name}")
+        cell.fill = fill
+        cell.font = font
+        cell.alignment = align
+        ws.row_dimensions[row_num].height = height
+
+    current_l1 = current_l2 = current_l3 = None
+    excel_row = 2
+
+    for _, row in sorted_df.iterrows():
+        l1   = row["category_level_1"]
+        l2   = row["category_level_2"] if pd.notna(row["category_level_2"]) else ""
+        l3   = row["category_level_3"] if pd.notna(row["category_level_3"]) else ""
+        fid  = str(row["full_numeric_id"])
+        leaf = row["leaf_category"]
+
+        parts = fid.split(".")
+        l1_id = parts[0]
+        l2_id = ".".join(parts[:2]) if len(parts) >= 2 else ""
+        l3_id = ".".join(parts[:3]) if len(parts) >= 3 else ""
+
+        if l1 != current_l1:
+            _header_row(excel_row, l1_id, l1, L1_FILL, L1_FONT, L1_ALIGN, height=24)
+            excel_row += 1
+            current_l1, current_l2, current_l3 = l1, None, None
+
+        if l2 and l2 != current_l2:
+            _header_row(excel_row, l2_id, l2, L2_FILL, L2_FONT, L2_ALIGN, height=20)
+            excel_row += 1
+            current_l2, current_l3 = l2, None
+
+        if l3 and l3 != current_l3:
+            _header_row(excel_row, l3_id, l3, L3_FILL, L3_FONT, L3_ALIGN, height=18)
+            excel_row += 1
+            current_l3 = l3
+
+        leaf_fill = PatternFill("solid", fgColor=leaf_color_map[leaf])
+        for col, (value, align) in enumerate([
+            (fid,  Alignment(horizontal="center", vertical="top")),
+            (str(row.get("technology_name", "")),        Alignment(horizontal="left", vertical="top")),
+            (str(row.get("Technology_Description", "")), Alignment(horizontal="left", vertical="top", wrap_text=True)),
+        ], start=1):
+            cell = ws.cell(row=excel_row, column=col, value=value)
+            cell.fill = leaf_fill
+            cell.font = TECH_FONT
+            cell.alignment = align
+        ws.row_dimensions[excel_row].height = 45
+        excel_row += 1
+
+
+def write_excel_output(result_df, summary_df, output):
+    """Write Technologies, Cluster Summary, and Overview sheets.
+
+    output: file path (str) or io.BytesIO — pd.ExcelWriter accepts both.
+    """
+    def _nat_key(id_str):
+        return [int(p) for p in str(id_str).split(".") if p.isdigit()]
+
+    summary_sorted = summary_df.sort_values("id", key=lambda s: s.map(_nat_key))
+    leaf_color_map = _build_leaf_color_map(result_df)
+
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        result_df.to_excel(writer,  sheet_name="Technologies",   index=False)
+        summary_sorted.to_excel(writer, sheet_name="Cluster Summary", index=False)
+        _style_cluster_summary(writer.book["Cluster Summary"], summary_sorted, leaf_color_map)
+        ws = writer.book.create_sheet("Overview")
+        _write_overview_sheet(ws, result_df, leaf_color_map)
+
+
+# ============================================================================
 # MAIN
 # ============================================================================
 
@@ -1646,9 +1797,7 @@ def main():
     summary_df = build_summary(result_df, summaries=summaries)
 
     # Save
-    with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
-        result_df.to_excel(writer, sheet_name="Technologies", index=False)
-        summary_df.to_excel(writer, sheet_name="Cluster Summary", index=False)
+    write_excel_output(result_df, summary_df, OUTPUT_FILE)
 
     # --- Print summary ---
     print(f"\nL1 algorithm: {l1_desc}")

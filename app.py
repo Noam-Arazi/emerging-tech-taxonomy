@@ -26,6 +26,7 @@ from hierarchical_taxonomy import (
     build_result_dataframe,
     assign_ids,
     build_summary,
+    write_excel_output,
 )
 
 # ============================================================================
@@ -392,9 +393,7 @@ with tab_search:
 
 with tab_download:
     output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        result_df.to_excel(writer,  sheet_name="Technologies",   index=False)
-        summary_df.to_excel(writer, sheet_name="Cluster Summary", index=False)
+    write_excel_output(result_df, summary_df, output)
 
     st.download_button(
         label="⬇️ Download Excel",
