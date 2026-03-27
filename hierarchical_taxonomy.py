@@ -87,28 +87,49 @@ FINAL_WEIGHTS = {
 # BEDROCK CLIENT + MODEL SELECTION
 # ============================================================================
 
-# Priority lists: first available active model wins.
-# Update these lists when new models are released — no other code changes needed.
+# Embedding fallback priority (Cohere only — embeddings don't use inference profiles)
 _EMBED_PRIORITY = [
-    "cohere.embed-english-v3",           # proven best (experiment winner)
-    "cohere.embed-multilingual-v3",      # fallback: multilingual variant
-    "cohere.embed-english-light-v3",     # light variant
+    "cohere.embed-english-v3",
+    "cohere.embed-multilingual-v3",
+    "cohere.embed-english-light-v3",
     "cohere.embed-multilingual-light-v3",
 ]
-_TEXT_PRIORITY = [
-    "anthropic.claude-3-5-sonnet-20241022-v2:0",   # best available as of 2025
-    "anthropic.claude-3-5-sonnet-20240620-v1:0",
-    "anthropic.claude-3-5-haiku-20241022-v1:0",
-    "anthropic.claude-3-sonnet-20240229-v1:0",     # was hardcoded — now last resort
-    "anthropic.claude-3-haiku-20240307-v1:0",
-]
+
+# Model-family preference for text: higher index = less preferred.
+# Used to rank inference profiles returned live by AWS — no hardcoded IDs needed.
+_TEXT_FAMILY_RANK = ["opus", "sonnet", "haiku"]  # best → worst within same generation
+
+
+def _score_text_profile(profile_id: str) -> tuple:
+    """
+    Return a sort key (higher = better) for an Anthropic inference profile ID.
+    Ranks by: generation number (higher better), then family (opus > sonnet > haiku).
+    Example: us.anthropic.claude-3-5-sonnet-20241022-v2:0
+    """
+    pid = profile_id.lower()
+    # Extract generation: claude-3-5 → (3, 5), claude-3 → (3, 0)
+    import re
+    gen_match = re.search(r"claude-(\d+)-?(\d*)", pid)
+    if not gen_match:
+        return (0, 0, 0)
+    major = int(gen_match.group(1))
+    minor = int(gen_match.group(2)) if gen_match.group(2) else 0
+    # Family rank: lower index in _TEXT_FAMILY_RANK = better → invert
+    family_score = next(
+        (len(_TEXT_FAMILY_RANK) - i for i, f in enumerate(_TEXT_FAMILY_RANK) if f in pid),
+        0,
+    )
+    return (major, minor, family_score)
 
 
 def pick_models():
     """
-    Query Bedrock for active foundation models and update EMBEDDING_MODEL_ID /
-    TEXT_MODEL_ID globals to the best available option.
-    Falls back to the original hardcoded values on any error.
+    Query Bedrock for available inference profiles and active embedding models,
+    then update EMBEDDING_MODEL_ID / TEXT_MODEL_ID globals to the best options.
+
+    Uses list_inference_profiles() for text models — these IDs are ready for
+    invocation as-is (correct prefix, always current). No hardcoded model IDs.
+    Falls back to existing defaults on any error.
     """
     global EMBEDDING_MODEL_ID, TEXT_MODEL_ID
     try:
@@ -118,18 +139,28 @@ def pick_models():
             aws_access_key_id=AWS_ACCESS_KEY_ID,
             aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
         )
-        available = set()
-        paginator = mgmt.get_paginator("list_foundation_models")
-        for page in paginator.paginate():
-            for m in page["modelSummaries"]:
-                if m.get("modelLifecycle", {}).get("status") == "ACTIVE":
-                    available.add(m["modelId"])
 
-        embed = next((m for m in _EMBED_PRIORITY if m in available), EMBEDDING_MODEL_ID)
-        text  = next((m for m in _TEXT_PRIORITY  if m in available), TEXT_MODEL_ID)
+        # ── Text model: pick best Anthropic inference profile ──
+        profiles_resp = mgmt.list_inference_profiles()
+        anthropic_profiles = [
+            p["inferenceProfileId"]
+            for p in profiles_resp.get("inferenceProfileSummaries", [])
+            if "anthropic.claude" in p.get("inferenceProfileId", "").lower()
+            and p.get("status", "ACTIVE") == "ACTIVE"
+        ]
+        if anthropic_profiles:
+            TEXT_MODEL_ID = max(anthropic_profiles, key=_score_text_profile)
 
+        # ── Embedding model: pick best available Cohere model ──
+        fm_resp = mgmt.list_foundation_models()
+        available_embed = {
+            m["modelId"]
+            for m in fm_resp.get("modelSummaries", [])
+            if m.get("modelLifecycle", {}).get("status") == "ACTIVE"
+        }
+        embed = next((m for m in _EMBED_PRIORITY if m in available_embed), EMBEDDING_MODEL_ID)
         EMBEDDING_MODEL_ID = embed
-        TEXT_MODEL_ID = text
+
         print(f"  Embedding model : {EMBEDDING_MODEL_ID}")
         print(f"  Text model      : {TEXT_MODEL_ID}")
     except Exception as e:
