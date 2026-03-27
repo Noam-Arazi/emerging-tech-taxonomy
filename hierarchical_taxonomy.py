@@ -84,17 +84,69 @@ FINAL_WEIGHTS = {
 
 
 # ============================================================================
-# BEDROCK CLIENT
+# BEDROCK CLIENT + MODEL SELECTION
 # ============================================================================
 
+# Priority lists: first available active model wins.
+# Update these lists when new models are released — no other code changes needed.
+_EMBED_PRIORITY = [
+    "cohere.embed-english-v3",           # proven best (experiment winner)
+    "cohere.embed-multilingual-v3",      # fallback: multilingual variant
+    "cohere.embed-english-light-v3",     # light variant
+    "cohere.embed-multilingual-light-v3",
+]
+_TEXT_PRIORITY = [
+    "anthropic.claude-3-5-sonnet-20241022-v2:0",   # best available as of 2025
+    "anthropic.claude-3-5-sonnet-20240620-v1:0",
+    "anthropic.claude-3-5-haiku-20241022-v1:0",
+    "anthropic.claude-3-sonnet-20240229-v1:0",     # was hardcoded — now last resort
+    "anthropic.claude-3-haiku-20240307-v1:0",
+]
+
+
+def pick_models():
+    """
+    Query Bedrock for active foundation models and update EMBEDDING_MODEL_ID /
+    TEXT_MODEL_ID globals to the best available option.
+    Falls back to the original hardcoded values on any error.
+    """
+    global EMBEDDING_MODEL_ID, TEXT_MODEL_ID
+    try:
+        mgmt = boto3.client(
+            service_name="bedrock",
+            region_name=AWS_REGION,
+            aws_access_key_id=AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+        )
+        available = set()
+        paginator = mgmt.get_paginator("list_foundation_models")
+        for page in paginator.paginate():
+            for m in page["modelSummaries"]:
+                if m.get("modelLifecycle", {}).get("status") == "ACTIVE":
+                    available.add(m["modelId"])
+
+        embed = next((m for m in _EMBED_PRIORITY if m in available), EMBEDDING_MODEL_ID)
+        text  = next((m for m in _TEXT_PRIORITY  if m in available), TEXT_MODEL_ID)
+
+        EMBEDDING_MODEL_ID = embed
+        TEXT_MODEL_ID = text
+        print(f"  Embedding model : {EMBEDDING_MODEL_ID}")
+        print(f"  Text model      : {TEXT_MODEL_ID}")
+    except Exception as e:
+        print(f"  Model auto-select failed ({e}) — using defaults")
+        print(f"  Embedding model : {EMBEDDING_MODEL_ID}")
+        print(f"  Text model      : {TEXT_MODEL_ID}")
+
+
 def create_bedrock_client():
+    pick_models()
     client = boto3.client(
         service_name="bedrock-runtime",
         region_name=AWS_REGION,
         aws_access_key_id=AWS_ACCESS_KEY_ID,
         aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
     )
-    print("Connected to Amazon Bedrock")
+    print("Connected to Amazon Bedrock (bedrock-runtime)")
     return client
 
 
