@@ -1,8 +1,29 @@
-credentials.json
+# Credentials — never commit
 config.py
-המרה לאמזון/קרדנשיאלס/
-__pycache__/
-.DS_Store
-*.docx
-*.xlsx
+credentials.json
+.env
+
+# Source data and results are confidential (Israel Innovation Authority
+# horizon-scanning cycle). Only the synthetic sample under data/ is tracked.
 *.csv
+*.xlsx
+*.docx
+*.npy
+!data/sample_technologies.csv
+!testing/results/experiment_results_public.xlsx
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# macOS
+.DS_Store
+
+# Internal working notes — describe the Authority process and real-data results
+CLAUDE.md
+.claude/
+TaxonomyTool/
+TaxonomyTool.zip
+run.command
+setup.command
